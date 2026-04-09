@@ -157,6 +157,7 @@ install: all $(MANPAGES)
 
 	@install -v python/undertaker-calc-coverage $(DESTDIR)$(BINDIR)
 	@install -v python/undertaker-kconfigdump $(DESTDIR)$(BINDIR)
+	@install -m 755 -v python/undertaker-unikraft-kconfigdump $(DESTDIR)$(BINDIR)
 	@install -v python/undertaker-checkpatch $(DESTDIR)$(BINDIR)
 	@install -v python/vampyr-spatch-wrapper $(DESTDIR)$(BINDIR)
 	@install -v python/fakecc $(DESTDIR)$(BINDIR)
@@ -176,6 +177,7 @@ install: all $(MANPAGES)
 	@install -v undertaker/predator $(DESTDIR)$(BINDIR)
 	@install -v undertaker/undertaker $(DESTDIR)$(BINDIR)
 	@install -v undertaker/undertaker-linux-tree $(DESTDIR)$(BINDIR)
+	@install -m 755 -v undertaker/undertaker-unikraft-tree $(DESTDIR)$(BINDIR)
 	@install -v undertaker/undertaker-coreboot-tree $(DESTDIR)$(BINDIR)
 	@install -v undertaker/undertaker-scan-head $(DESTDIR)$(BINDIR)
 	@install -v undertaker/undertaker-busybox-tree $(DESTDIR)$(BINDIR)
@@ -189,6 +191,7 @@ install: all $(MANPAGES)
 	@install -v scripts/Makefile.list $(DESTDIR)$(LIBDIR)
 	@install -v scripts/Makefile.list_recursion $(DESTDIR)$(LIBDIR)
 	@install -v scripts/Makefile.list_fiasco $(DESTDIR)$(LIBDIR)
+	@install -m 0644 -v etc/undertaker/arch-map-unikraft.conf $(DESTDIR)$(ETCDIR)/undertaker
 
 	@install -v -m 0644 contrib/undertaker.el $(DESTDIR)$(PREFIX)/share/emacs/site-lisp/undertaker
 

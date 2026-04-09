@@ -370,6 +370,9 @@ def determine_buildsystem_variables(arch=None):
     if arch == 'coreboot':
         cmd = r"find . \( -name Makefile.inc -o -name Makefile \) " + \
               r"-exec sed -n '/CONFIG_/p' {} \+"
+    elif arch == 'unikraft':
+        cmd = r"find . \( -name Makefile.uk -o -name Makefile -o -name Kbuild \) " + \
+              r"! -path './build/*' -exec sed -n '/CONFIG_/p' {} \+"
     elif arch:
         cmd = r"find . \( -name Kbuild -o -name Makefile \) " + \
               r"\( ! -path './arch/*' -o -path './arch/%(arch)s/*' \) " + \
@@ -391,6 +394,7 @@ def determine_buildsystem_variables_in_directory(directory, arch=''):
     filenames = []
     kbuild = os.path.join(directory, "Kbuild")
     makefile = os.path.join(directory, "Makefile")
+    makefileuk = os.path.join(directory, "Makefile.uk")
     makefileinc = os.path.join(directory, "Makefile.inc")
 
     if os.path.exists(kbuild):
@@ -398,6 +402,9 @@ def determine_buildsystem_variables_in_directory(directory, arch=''):
 
     if os.path.exists(makefile):
         filenames.append(makefile)
+
+    if arch == 'unikraft' and os.path.exists(makefileuk):
+        filenames.append(makefileuk)
 
     if arch == 'coreboot' and os.path.exists(makefileinc):
         filenames.append(makefileinc)
@@ -610,6 +617,12 @@ def is_coreboot():
             if fd.read().find('This file is part of the coreboot project.') != -1:
                 return True
     return False
+
+def is_unikraft():
+    """
+    Check if we are inside a Unikraft tree.
+    """
+    return os.path.isfile("Config.uk") or os.path.isfile("Makefile.uk")
 
 def find_scripts_basedir():
     executable = os.path.realpath(sys.argv[0])

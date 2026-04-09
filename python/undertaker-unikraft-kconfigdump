@@ -1,0 +1,154 @@
+#!/bin/bash -e
+#
+#   undertaker-unikraft-kconfigdump - generate baseline models in Unikraft trees
+#
+# Copyright (C) 2026 GitHub Copilot
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LEGACY_SCRIPT="$SCRIPT_DIR/undertaker-kconfigdump"
+
+if [ ! -f Config.uk ] && [ ! -f Makefile.uk ]; then
+    exec "$LEGACY_SCRIPT" "$@"
+fi
+
+MODELS=${MODELS:-models}
+ARCH=${UK_ARCH:-x86_64}
+
+usage() {
+    echo "\`undertaker-unikraft-kconfigdump' generates baseline models for Unikraft"
+    echo
+    echo "Usage: ${0##*/} [-a ARCH] [-m DIR]"
+    echo " -a <arch>      Architecture/model name (default: UK_ARCH or x86_64)"
+    echo " -m <modeldir>  Directory where models are written (default: models)"
+}
+
+while getopts :a:m:h OPT; do
+    case $OPT in
+        a)
+            ARCH="$OPTARG"
+            ;;
+        m)
+            MODELS="$OPTARG"
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+OPTIND=1
+
+mkdir -p "$MODELS"
+
+MODEL_FILE="$MODELS/$ARCH.model"
+TMP_BODY="$MODELS/$ARCH.model.body.tmp"
+TMP_FILES="$MODELS/$ARCH.model.files.tmp"
+TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
+
+CONFIG_FILE=""
+for candidate in "build/config" ".config"; do
+    if [ -f "$candidate" ]; then
+        CONFIG_FILE="$candidate"
+        break
+    fi
+done
+
+if [ -z "$CONFIG_FILE" ]; then
+    echo "No configuration file found (expected build/config or .config)."
+    echo "Run a Unikraft configure/build step first, then rerun this command."
+    exit 1
+fi
+
+CCDB_FILE=""
+for candidate in "build/compile_commands.json" "compile_commands.json"; do
+    if [ -f "$candidate" ]; then
+        CCDB_FILE="$candidate"
+        break
+    fi
+done
+
+ROOT_DIR=$(pwd -P)
+
+# Build symbol list from the active configuration.
+awk -F= '
+/^CONFIG_[A-Za-z0-9_]+=(y|m)$/ {
+    print $1
+    if ($2 == "m")
+        print $1 "_MODULE"
+}
+' "$CONFIG_FILE" | sort -u > "$TMP_SYMBOLS"
+
+# Build FILE_* inferences from compile_commands if available.
+: > "$TMP_FILES"
+if [ -n "$CCDB_FILE" ]; then
+    grep -E '"file"[[:space:]]*:' "$CCDB_FILE" | \
+        sed -E 's/.*"file"[[:space:]]*:[[:space:]]*"([^\"]+)".*/\1/' | \
+        while IFS= read -r path; do
+            file_path=$(printf '%s' "$path" | sed 's#\\\\#/#g;s#\\#/#g')
+            case "$file_path" in
+                "$ROOT_DIR"/*)
+                    rel_path=${file_path#"$ROOT_DIR"/}
+                    ;;
+                ./*)
+                    rel_path=${file_path#./}
+                    ;;
+                *)
+                    rel_path=$file_path
+                    ;;
+            esac
+            norm_path=$(printf '%s' "$rel_path" | sed 's#^\./##;s#[-+:,/]#_#g')
+            printf 'FILE_%s\n' "$norm_path"
+        done | sort -u > "$TMP_FILES"
+fi
+
+: > "$TMP_BODY"
+cat "$TMP_SYMBOLS" >> "$TMP_BODY"
+cat "$TMP_FILES" >> "$TMP_BODY"
+
+# Create a provisional model so minigolem can resolve the selected model path.
+{
+    echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
+    echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""
+    echo "UNDERTAKER_SET ALWAYS_ON"
+    sort -u "$TMP_BODY"
+} > "$MODEL_FILE"
+
+# Try to enrich with parser-derived file preconditions.
+if which minigolem >/dev/null 2>&1; then
+    if ! minigolem -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u >> "$TMP_BODY"; then
+        echo "Warning: minigolem precondition extraction failed for $ARCH; continuing with baseline model." >&2
+    fi
+fi
+
+{
+    echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
+    echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""
+    echo "UNDERTAKER_SET ALWAYS_ON"
+    sort -u "$TMP_BODY"
+} > "$MODEL_FILE"
+
+rm -f "$TMP_BODY" "$TMP_FILES" "$TMP_SYMBOLS"
+
+echo "Generated baseline Unikraft model: $MODEL_FILE"
+if [ -n "$CCDB_FILE" ]; then
+    echo "Included FILE_ entries from: $CCDB_FILE"
+fi
+echo "Configuration source: $CONFIG_FILE"

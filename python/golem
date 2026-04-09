@@ -161,6 +161,15 @@ def main():
         arch = 'coreboot'
         if os.environ.has_key('SUBARCH'):
             subarch = os.environ['SUBARCH']
+    elif kbuild.is_unikraft():
+        logging.info("detected a Unikraft tree")
+        arch = 'unikraft'
+        if os.environ.has_key('ARCH'):
+            subarch = os.environ['ARCH']
+        elif os.environ.has_key('UK_ARCH'):
+            subarch = os.environ['UK_ARCH']
+        else:
+            subarch = 'x86_64'
     else:
         sys.exit("No supported software project found")
 

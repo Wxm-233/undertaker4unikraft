@@ -201,6 +201,14 @@ def main(argv):
         logging.info("Detected a Coreboot tree")
         arch = 'coreboot'
         project = "coreboot"
+    elif Kbuild.is_unikraft():
+    # ... or Unikraft?
+        logging.info("Detected a Unikraft tree")
+        project = "unikraft"
+        if not arch:
+            arch = 'x86_64'
+        if not args.arch:
+            args.arch = arch
 
     if args.model:
         modelfile = args.model

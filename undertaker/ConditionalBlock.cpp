@@ -34,6 +34,10 @@ typedef PumaConditionalBlock ConditionalBlockImpl;
 
 #include <boost/regex.hpp>
 #include <boost/filesystem.hpp>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <vector>
 #include <set>
 
 
@@ -86,6 +90,118 @@ static ConditionalBlockImpl *createDummyElseBlock(ConditionalBlock *i, Condition
 // initialize static filename_regex at startup
 const boost::regex CppFile::filename_regex(R"(^.*/arch/([A-Za-z0-9]+)/.*$)");
 
+namespace {
+
+struct ArchMapRule {
+    boost::regex pattern;
+    std::string arch;
+};
+
+std::vector<std::string> splitPathSegments(std::string path) {
+    for (char &c : path)
+        if (c == '\\')
+            c = '/';
+
+    std::vector<std::string> segments;
+    std::string current;
+    for (char c : path) {
+        if (c == '/') {
+            if (!current.empty()) {
+                segments.push_back(current);
+                current.clear();
+            }
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty())
+        segments.push_back(current);
+    return segments;
+}
+
+std::vector<ArchMapRule> loadArchMap() {
+    static std::vector<ArchMapRule> cached;
+    static bool initialized = false;
+
+    if (initialized)
+        return cached;
+    initialized = true;
+
+    const char *mapPath = std::getenv("UNDERTAKER_ARCH_MAP");
+    std::vector<std::string> candidates;
+    if (mapPath && *mapPath)
+        candidates.emplace_back(mapPath);
+    candidates.emplace_back("etc/undertaker/arch-map-unikraft.conf");
+    candidates.emplace_back("../etc/undertaker/arch-map-unikraft.conf");
+
+    std::ifstream input;
+    std::string selectedPath;
+    for (const std::string &candidate : candidates) {
+        input.close();
+        input.clear();
+        input.open(candidate.c_str());
+        if (input.good()) {
+            selectedPath = candidate;
+            break;
+        }
+    }
+
+    if (!input.good())
+        return cached;
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        std::istringstream iss(line);
+        std::string regexText;
+        std::string arch;
+        if (!(iss >> regexText >> arch))
+            continue;
+
+        try {
+            cached.push_back({boost::regex(regexText), arch});
+        } catch (const boost::regex_error &e) {
+            Logging::warn("Ignoring invalid arch map rule from ", selectedPath, ": ", e.what());
+        }
+    }
+
+    return cached;
+}
+
+std::string findMappedArch(const std::string &absolutePath) {
+    const auto rules = loadArchMap();
+    for (const auto &rule : rules) {
+        if (boost::regex_match(absolutePath, rule.pattern))
+            return rule.arch;
+    }
+
+    const auto segments = splitPathSegments(absolutePath);
+    bool inArchContext = false;
+    for (const std::string &segment : segments) {
+        if (segment == "arch" || segment == "plat") {
+            inArchContext = true;
+            continue;
+        }
+
+        if (!inArchContext)
+            continue;
+
+        if (ModelContainer::lookupModel(segment))
+            return segment;
+    }
+
+    static const boost::regex fallback_regex(R"(^.*/arch/([A-Za-z0-9]+)/.*$)");
+    boost::smatch what;
+    if (boost::regex_match(absolutePath, what, fallback_regex))
+        return what[1];
+
+    return {};
+}
+
+} // namespace
+
 CppFile::CppFile(const std::string &f) {
     if (!boost::filesystem::exists(f))
         return;
@@ -97,12 +213,7 @@ CppFile::CppFile(const std::string &f) {
     top_block = _builder->topBlock();
 
     boost::filesystem::path filepath(filename);
-    // check if the 'absolute path' to the given file matches the regex
-    boost::smatch what;
-    if (boost::regex_match(absolute(filepath).string(), what, filename_regex))
-        // check if a matching model has been loaded for the found arch in filename
-        if (nullptr != ModelContainer::lookupModel(what[1]))
-            specific_arch = what[1];
+    specific_arch = findMappedArch(absolute(filepath).string());
 }
 
 CppFile::~CppFile() {

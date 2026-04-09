@@ -37,6 +37,7 @@
 #include "../version.h"
 
 #include <fstream>
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 #include <sys/wait.h>
@@ -69,6 +70,7 @@ static const char *coverage_exec_cmd = "cat";
 static bool skip_non_configuration_based_defects = false;
 static bool decision_coverage = false;
 static bool do_mus_analysis = false;
+static bool unikraft_mode = false;
 
 void usage(std::ostream &out, const char *error) {
     if (error)
@@ -85,6 +87,7 @@ void usage(std::ostream &out, const char *error) {
     "  -B  specify a blacklist\n"
     "  -m  specify the model(s) (directory or file)\n"
     "  -M  specify the main model architecture (default: x86)\n"
+    "  -k  enable Unikraft defaults (prefer x86_64 as main model)\n"
     "  -j  specify the job that should be done\n"
     "      dead      - dead/undead file analysis (default)\n"
     "      coverage  - coverage file analysis\n"
@@ -867,7 +870,7 @@ int main(int argc, char **argv) {
     coverageOutputMode = CoverageOutput::KCONFIG;
     coverageMode = CoverageMode::SIMPLE;
 
-    while ((opt = getopt(argc, argv, "ucb:M:m:t:i:B:W:sj:O:C:I:Vhvq")) != -1) {
+    while ((opt = getopt(argc, argv, "uckb:M:m:t:i:B:W:sj:O:C:I:Vhvq")) != -1) {
         switch (opt) {
             int n;
         case 'i':
@@ -906,6 +909,9 @@ int main(int argc, char **argv) {
             else
                 Logging::error("Cannot do MUS-Analysis: picomus not in PATH. Continuing without "
                                "MUS-Analysis.");
+            break;
+        case 'k':
+            unikraft_mode = true;
             break;
         case 'c':
             process_file = process_file_coverage;
@@ -1055,8 +1061,18 @@ int main(int argc, char **argv) {
     } else if (model_container.size() > 1) {
         /* the main model is default */
         if (main_model == "default") {
-            // if 'x86' is not present, load the first one in model_container
-            if (nullptr == model_container.lookupModel("x86")) {
+            if (unikraft_mode) {
+                if (nullptr != model_container.lookupModel("x86_64")) {
+                    model_container.setMainModel("x86_64");
+                } else if (nullptr != model_container.lookupModel("x86")) {
+                    Logging::warn("Unikraft mode requested, but 'x86_64' is not loaded. Falling back to 'x86'.");
+                    model_container.setMainModel("x86");
+                } else {
+                    const std::string &first = model_container.begin()->first;
+                    Logging::warn("Unikraft mode requested, but neither 'x86_64' nor 'x86' is loaded. Using '", first, "' instead.");
+                    model_container.setMainModel(first);
+                }
+            } else if (nullptr == model_container.lookupModel("x86")) {
                 const std::string &first = model_container.begin()->first;
                 Logging::error("Default Main-Model 'x86' not found. Using '", first, "' instead.");
                 model_container.setMainModel(first);
