@@ -1,3 +1,3 @@
 """kbuildparse support for Unikraft."""
 
-from .unikraft import *
+from kbuildparse.unikraft.unikraft import *
