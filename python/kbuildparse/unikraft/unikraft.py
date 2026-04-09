@@ -15,12 +15,62 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+import logging
 import os
 import re
 
 import kbuildparse.base_classes as BaseClasses
 import kbuildparse.data_structures as DataStructures
 import kbuildparse.linux.linux as Linux
+
+
+def _regex_else_match_unikraft(line, ifdef_condition, global_vars):
+    """Unikraft variant of else handling that tolerates unmatched else."""
+    regex_match = Linux.REGEX_ELSE.match(line)
+    if not regex_match:
+        return False
+
+    if global_vars["no_config_nesting"] > 0:
+        return True
+
+    if len(ifdef_condition) == 0:
+        logging.debug("Ignoring unmatched else in Unikraft makefile")
+        return True
+
+    last = ifdef_condition.pop()
+    if last.startswith("!"):
+        ifdef_condition.add_condition(last[1:])
+    else:
+        ifdef_condition.add_condition("!" + last)
+    return True
+
+
+def _regex_endif_match_unikraft(line, ifdef_condition, global_vars):
+    """Unikraft variant of endif handling that tolerates unmatched endif."""
+    regex_match = Linux.REGEX_ENDIF.match(line)
+    if not regex_match:
+        return False
+
+    if global_vars["no_config_nesting"] > 0:
+        global_vars.decrement_variable("no_config_nesting")
+        return True
+
+    if len(ifdef_condition) == 0:
+        logging.debug("Ignoring unmatched endif in Unikraft makefile")
+        return True
+
+    ifdef_condition.pop()
+    return True
+
+
+def _update_if_condition_unikraft(line, ifdef_condition, global_vars, local_vars, model):
+    """Update the condition stack while being tolerant to malformed nesting."""
+    if Linux.regex_ifneq_match(line, ifdef_condition, global_vars, model) or \
+            Linux.regex_ifndef_match(line, ifdef_condition, global_vars, model) or \
+            _regex_else_match_unikraft(line, ifdef_condition, global_vars) or \
+            _regex_endif_match_unikraft(line, ifdef_condition, global_vars):
+        return True
+    return global_vars["no_config_nesting"] > 0
 
 
 class UnikraftInit(Linux.LinuxInit):
@@ -83,6 +133,19 @@ class _01_UnikraftIf(Linux._01_LinuxIf):
 
     def __init__(self, model, arch):
         super(_01_UnikraftIf, self).__init__(model, arch)
+
+    def process(self, parser, line, basepath):
+        _line = line.processed_line
+        retval = _update_if_condition_unikraft(
+            _line,
+            parser.local_vars["ifdef_condition"],
+            parser.global_vars,
+            parser.local_vars,
+            self.model,
+        )
+        line.condition = parser.local_vars["ifdef_condition"][:]
+        line.invalid = retval
+        return retval
 
 
 class _02_UnikraftObjects(Linux._02_LinuxObjects):
