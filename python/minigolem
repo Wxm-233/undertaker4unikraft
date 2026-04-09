@@ -209,6 +209,8 @@ def main(argv):
             arch = 'x86_64'
         if not args.arch:
             args.arch = arch
+    elif not args.classes:
+        sys.exit("E: no supported software project found")
 
     if args.model:
         modelfile = args.model

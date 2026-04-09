@@ -24,6 +24,62 @@ DEFAULT_ARCH="x86_64"
 MODELS=${MODELS:-models}
 PROCESSORS=${PROCESSORS:-$(getconf _NPROCESSORS_ONLN)}
 
+find_undertaker_basepath() {
+    if [ -n "$UNDERTAKER_BASE" ]; then
+        echo "$UNDERTAKER_BASE"
+        return 0
+    fi
+
+    local script_dir
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    local source_base
+    source_base=$(readlink -f "$script_dir/..")
+
+    local ud
+    ud=$(which undertaker)
+    if [ -z "$ud" ]; then
+        echo "$source_base"
+        return 0
+    fi
+
+    local undertaker_path
+    undertaker_path=$(readlink -f "$ud")
+    local b
+    b=$(dirname "$undertaker_path")
+    echo "${b}/.."
+}
+
+find_undertaker_cmd() {
+    if which undertaker >/dev/null 2>&1; then
+        echo "undertaker"
+        return 0
+    fi
+
+    local base
+    base=$(find_undertaker_basepath)
+    local local_bin="$base/undertaker/undertaker"
+    if [ -x "$local_bin" ]; then
+        echo "$local_bin"
+        return 0
+    fi
+
+    if [ -f "$base/Makefile" ] && which make >/dev/null 2>&1; then
+        echo "No undertaker binary found, trying to build it from source at $base..." >&2
+        local build_log
+        build_log="$base/undertaker-unikraft-tree.build.log"
+        if make -C "$base" undertaker/undertaker >"$build_log" 2>&1; then
+            if [ -x "$local_bin" ]; then
+                echo "$local_bin"
+                return 0
+            fi
+        else
+            echo "Auto-build failed, see $build_log" >&2
+        fi
+    fi
+
+    return 1
+}
+
 usage() {
     echo "\`undertaker-unikraft-tree' drives undertaker over a whole Unikraft tree"
     echo
@@ -73,14 +129,33 @@ if [ ! -f Config.uk ] && [ ! -f Makefile.uk ]; then
     exit 1
 fi
 
-if ! which undertaker > /dev/null; then
-    echo "No undertaker binary found."
+UNDERTAKER_CMD=$(find_undertaker_cmd || true)
+if [ -z "$UNDERTAKER_CMD" ]; then
+    echo "No undertaker binary found (PATH or source build output)."
     exit 1
 fi
 
 if ! ls "$MODELS"/*.model >/dev/null 2>&1 && ! ls "$MODELS"/*.cnf >/dev/null 2>&1; then
-    echo "No models found, please call the Unikraft kconfigdump pipeline first"
-    exit 1
+    echo "No models found in $MODELS, trying to generate baseline Unikraft models..."
+    UK_DUMP="$(find_undertaker_basepath)/bin/undertaker-unikraft-kconfigdump"
+    if [ ! -x "$UK_DUMP" ]; then
+        UK_DUMP="$(find_undertaker_basepath)/python/undertaker-unikraft-kconfigdump"
+    fi
+
+    if [ ! -f "$UK_DUMP" ] && [ ! -x "$UK_DUMP" ]; then
+        echo "Could not find undertaker-unikraft-kconfigdump (checked install and source paths)."
+        exit 1
+    fi
+
+    if ! bash "$UK_DUMP" -a "$DEFAULT_ARCH" -m "$MODELS"; then
+        echo "Automatic model generation failed."
+        exit 1
+    fi
+
+    if ! ls "$MODELS"/*.model >/dev/null 2>&1 && ! ls "$MODELS"/*.cnf >/dev/null 2>&1; then
+        echo "Model generation did not produce usable model files."
+        exit 1
+    fi
 fi
 
 make_worklist() {
@@ -96,7 +171,7 @@ if [ "$MODE" = "calc-coverage" ]; then
     files=$(wc -l < undertaker-unikraft-coverage-worklist)
     echo "Calculating partial configurations (greedy variant) on $files files"
 
-    undertaker -k -v -j coverage -C min -t "$PROCESSORS" \
+    "$UNDERTAKER_CMD" -k -v -j coverage -C min -t "$PROCESSORS" \
         -b undertaker-unikraft-coverage-worklist \
         -m "$MODELS" -M "$DEFAULT_ARCH" 2>&1 | grep '^I: ./' > coverage.txt
 
@@ -115,7 +190,7 @@ fi
 if [ "$MODE" = "feature-statistics" ]; then
     make_worklist undertaker-unikraft-worklist
 
-    undertaker -k -j cppsym -b undertaker-unikraft-worklist -m "$MODELS" -M "$DEFAULT_ARCH" \
+    "$UNDERTAKER_CMD" -k -j cppsym -b undertaker-unikraft-worklist -m "$MODELS" -M "$DEFAULT_ARCH" \
         2>undertaker-unikraft-cppsym.errors >undertaker-unikraft-all-cppsym.raw
     awk '
 BEGIN { FS=", " }
@@ -137,6 +212,6 @@ make_worklist undertaker-unikraft-worklist
 find . -type f -name '*dead' -delete
 
 echo "Analyzing $(wc -l < undertaker-unikraft-worklist) files with $PROCESSORS threads."
-undertaker -k -t "$PROCESSORS" -b undertaker-unikraft-worklist -m "$MODELS" -M "$DEFAULT_ARCH"
+"$UNDERTAKER_CMD" -k -t "$PROCESSORS" -b undertaker-unikraft-worklist -m "$MODELS" -M "$DEFAULT_ARCH"
 printf "\n\nFound %s global defects\n" "$(find . -name '*dead' | grep globally | grep -v no_kconfig | wc -l)"
 exit 0
