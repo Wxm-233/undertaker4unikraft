@@ -1,3 +1,0 @@
-make: Entering directory '/mnt/d/Documents/code/undertaker'
-Makefile:67: *** "No local Puma library found! Please call 'make localpuma' or specify a path to a copy of the pre-woven Puma sources via 'LOCALPUMA=/path/to/aspectc++/Puma/ make'".  Stop.
-make: Leaving directory '/mnt/d/Documents/code/undertaker'
