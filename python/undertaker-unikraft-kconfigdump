@@ -59,9 +59,12 @@ OPTIND=1
 mkdir -p "$MODELS"
 
 MODEL_FILE="$MODELS/$ARCH.model"
+RSF_FILE="$MODELS/$ARCH.rsf"
 TMP_BODY="$MODELS/$ARCH.model.body.tmp"
 TMP_FILES="$MODELS/$ARCH.model.files.tmp"
 TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
+TMP_DECLARED="$MODELS/$ARCH.model.declared.tmp"
+TMP_RSFSYMS="$MODELS/$ARCH.rsf.symbols.tmp"
 
 CONFIG_FILE=""
 for candidate in "build/config" ".config"; do
@@ -87,6 +90,13 @@ done
 
 ROOT_DIR=$(pwd -P)
 
+# Collect all declared Kconfig symbols from Unikraft config sources.
+find . -type f \( -name 'Config.uk' -o -name 'Kconfig*' \) \
+    ! -path './build/*' ! -path './.git/*' ! -path './.git' -print0 | \
+    xargs -0 grep -h -E '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null | \
+    sed -E 's/^[[:space:]]*(config|menuconfig)[[:space:]]+([A-Za-z0-9_]+).*$/CONFIG_\2/' | \
+    sort -u > "$TMP_DECLARED"
+
 # Build symbol list from the active configuration.
 awk -F= '
 /^CONFIG_[A-Za-z0-9_]+=(y|m)$/ {
@@ -95,6 +105,10 @@ awk -F= '
         print $1 "_MODULE"
 }
 ' "$CONFIG_FILE" | sort -u > "$TMP_SYMBOLS"
+
+# Merge declared and active symbols to increase model coverage.
+cat "$TMP_DECLARED" "$TMP_SYMBOLS" | sort -u > "$TMP_SYMBOLS.merged"
+mv "$TMP_SYMBOLS.merged" "$TMP_SYMBOLS"
 
 # Build FILE_* inferences from compile_commands if available.
 : > "$TMP_FILES"
@@ -131,6 +145,15 @@ cat "$TMP_FILES" >> "$TMP_BODY"
     sort -u "$TMP_BODY"
 } > "$MODEL_FILE"
 
+# Generate a minimal RSF alongside the model for tooling that expects it.
+sed -n -E 's/^CONFIG_([A-Za-z0-9_]+)$/\1/p' "$TMP_SYMBOLS" | sort -u > "$TMP_RSFSYMS"
+{
+    echo "# Auto-generated baseline RSF for Unikraft"
+    while IFS= read -r sym; do
+        [ -n "$sym" ] && printf 'Item\t%s\tboolean\n' "$sym"
+    done < "$TMP_RSFSYMS"
+} > "$RSF_FILE"
+
 # Try to enrich with parser-derived file preconditions.
 if which minigolem >/dev/null 2>&1; then
     if ! minigolem -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u >> "$TMP_BODY"; then
@@ -145,9 +168,10 @@ fi
     sort -u "$TMP_BODY"
 } > "$MODEL_FILE"
 
-rm -f "$TMP_BODY" "$TMP_FILES" "$TMP_SYMBOLS"
+rm -f "$TMP_BODY" "$TMP_FILES" "$TMP_SYMBOLS" "$TMP_DECLARED" "$TMP_RSFSYMS"
 
 echo "Generated baseline Unikraft model: $MODEL_FILE"
+echo "Generated baseline Unikraft RSF: $RSF_FILE"
 if [ -n "$CCDB_FILE" ]; then
     echo "Included FILE_ entries from: $CCDB_FILE"
 fi
