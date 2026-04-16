@@ -60,11 +60,13 @@ mkdir -p "$MODELS"
 
 MODEL_FILE="$MODELS/$ARCH.model"
 RSF_FILE="$MODELS/$ARCH.rsf"
+BASE_MODEL_FILE="$MODELS/$ARCH.model.base.tmp"
 TMP_BODY="$MODELS/$ARCH.model.body.tmp"
+TMP_MINIGOLEM="$MODELS/$ARCH.preconditions.tmp"
 TMP_FILES="$MODELS/$ARCH.model.files.tmp"
 TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
-TMP_DECLARED="$MODELS/$ARCH.model.declared.tmp"
-TMP_RSFSYMS="$MODELS/$ARCH.rsf.symbols.tmp"
+TMP_MODEL_SYMBOLS="$MODELS/$ARCH.model.symbols.base.tmp"
+TMP_EXTRA_SYMBOLS="$MODELS/$ARCH.model.symbols.extra.tmp"
 
 CONFIG_FILE=""
 for candidate in "build/config" ".config"; do
@@ -89,26 +91,61 @@ for candidate in "build/compile_commands.json" "compile_commands.json"; do
 done
 
 ROOT_DIR=$(pwd -P)
+RSF_DUMPER="$SCRIPT_DIR/undertaker-unikraft-rsfdump"
 
-# Collect all declared Kconfig symbols from Unikraft config sources.
-find . -type f \( -name 'Config.uk' -o -name 'Kconfig*' \) \
-    ! -path './build/*' ! -path './.git/*' ! -path './.git' -print0 | \
-    xargs -0 grep -h -E '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null | \
-    sed -E 's/^[[:space:]]*(config|menuconfig)[[:space:]]+([A-Za-z0-9_]+).*$/CONFIG_\2/' | \
-    sort -u > "$TMP_DECLARED"
+if [ ! -x "$RSF_DUMPER" ]; then
+    RSF_DUMPER=$(which undertaker-unikraft-rsfdump || true)
+fi
 
-# Build symbol list from the active configuration.
+run_rsfdump() {
+    if "$RSF_DUMPER" . "$RSF_FILE" >/dev/null 2>/dev/null; then
+        return 0
+    fi
+
+    if which python3 >/dev/null 2>&1; then
+        python3 "$RSF_DUMPER" . "$RSF_FILE" >/dev/null
+        return $?
+    fi
+
+    return 1
+}
+
+if [ -x "$RSF_DUMPER" ]; then
+    if ! run_rsfdump; then
+        echo "Warning: RSF dumper failed, falling back to minimal RSF generation." >&2
+    fi
+fi
+
+if [ ! -s "$RSF_FILE" ]; then
+    # Fallback: minimal RSF from declared symbols only.
+    find . -type f \( -name 'Config.uk' -o -name 'Kconfig*' \) \
+        ! -path './build/*' ! -path './.git/*' ! -path './.git' -print0 | \
+        xargs -0 grep -h -E '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null | \
+        sed -E 's/^[[:space:]]*(config|menuconfig)[[:space:]]+([A-Za-z0-9_]+).*$/Item\t\2\tboolean/' | \
+        sort -u > "$RSF_FILE"
+fi
+
+# Build symbol list from RSF item declarations.
+awk '
+/^Item[[:space:]]+/ {
+    print "CONFIG_" $2;
+    if ($3 == "tristate")
+        print "CONFIG_" $2 "_MODULE";
+}
+' "$RSF_FILE" | sort -u > "$TMP_SYMBOLS"
+
+# Merge with symbols from the active configuration.
 awk -F= '
 /^CONFIG_[A-Za-z0-9_]+=(y|m)$/ {
     print $1
     if ($2 == "m")
         print $1 "_MODULE"
 }
-' "$CONFIG_FILE" | sort -u > "$TMP_SYMBOLS"
+' "$CONFIG_FILE" | sort -u > "$TMP_SYMBOLS.active"
 
-# Merge declared and active symbols to increase model coverage.
-cat "$TMP_DECLARED" "$TMP_SYMBOLS" | sort -u > "$TMP_SYMBOLS.merged"
+cat "$TMP_SYMBOLS" "$TMP_SYMBOLS.active" | sort -u > "$TMP_SYMBOLS.merged"
 mv "$TMP_SYMBOLS.merged" "$TMP_SYMBOLS"
+rm -f "$TMP_SYMBOLS.active"
 
 # Build FILE_* inferences from compile_commands if available.
 : > "$TMP_FILES"
@@ -134,41 +171,51 @@ if [ -n "$CCDB_FILE" ]; then
 fi
 
 : > "$TMP_BODY"
-cat "$TMP_SYMBOLS" >> "$TMP_BODY"
 cat "$TMP_FILES" >> "$TMP_BODY"
+: > "$TMP_MINIGOLEM"
 
-# Create a provisional model so minigolem can resolve the selected model path.
-{
-    echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
-    echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""
-    echo "UNDERTAKER_SET ALWAYS_ON"
-    sort -u "$TMP_BODY"
-} > "$MODEL_FILE"
+# Generate a base model from RSF when possible.
+if which rsf2model >/dev/null 2>&1; then
+    rsf2model "$RSF_FILE" > "$BASE_MODEL_FILE"
+else
+    {
+        echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
+        echo "UNDERTAKER_SET ALWAYS_ON"
+        cat "$TMP_SYMBOLS"
+    } > "$BASE_MODEL_FILE"
+fi
 
-# Generate a minimal RSF alongside the model for tooling that expects it.
-sed -n -E 's/^CONFIG_([A-Za-z0-9_]+)$/\1/p' "$TMP_SYMBOLS" | sort -u > "$TMP_RSFSYMS"
-{
-    echo "# Auto-generated baseline RSF for Unikraft"
-    while IFS= read -r sym; do
-        [ -n "$sym" ] && printf 'Item\t%s\tboolean\n' "$sym"
-    done < "$TMP_RSFSYMS"
-} > "$RSF_FILE"
+if ! grep -q '^UNDERTAKER_SET CONFIGURATION_SPACE_REGEX' "$BASE_MODEL_FILE"; then
+    {
+        echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""
+        cat "$BASE_MODEL_FILE"
+    } > "$BASE_MODEL_FILE.withregex"
+    mv "$BASE_MODEL_FILE.withregex" "$BASE_MODEL_FILE"
+fi
+
+# Ensure symbols from the active config are present even if RSF extraction misses some.
+grep -E '^CONFIG_[A-Za-z0-9_]+' "$BASE_MODEL_FILE" | awk '{print $1}' | sort -u > "$TMP_MODEL_SYMBOLS"
+comm -23 "$TMP_SYMBOLS" "$TMP_MODEL_SYMBOLS" > "$TMP_EXTRA_SYMBOLS"
+cat "$TMP_EXTRA_SYMBOLS" >> "$BASE_MODEL_FILE"
+rm -f "$TMP_MODEL_SYMBOLS" "$TMP_EXTRA_SYMBOLS"
+
+# Create a provisional model for minigolem.
+cp "$BASE_MODEL_FILE" "$MODEL_FILE"
 
 # Try to enrich with parser-derived file preconditions.
 if which minigolem >/dev/null 2>&1; then
-    if ! minigolem -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u >> "$TMP_BODY"; then
+    if ! minigolem -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u > "$TMP_MINIGOLEM"; then
         echo "Warning: minigolem precondition extraction failed for $ARCH; continuing with baseline model." >&2
     fi
 fi
 
-{
-    echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
-    echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""
-    echo "UNDERTAKER_SET ALWAYS_ON"
-    sort -u "$TMP_BODY"
-} > "$MODEL_FILE"
+cat "$TMP_MINIGOLEM" >> "$TMP_BODY"
+sort -u "$TMP_BODY" > "$TMP_BODY.sorted"
 
-rm -f "$TMP_BODY" "$TMP_FILES" "$TMP_SYMBOLS" "$TMP_DECLARED" "$TMP_RSFSYMS"
+cp "$BASE_MODEL_FILE" "$MODEL_FILE"
+cat "$TMP_BODY.sorted" >> "$MODEL_FILE"
+
+rm -f "$TMP_BODY" "$TMP_BODY.sorted" "$TMP_MINIGOLEM" "$TMP_FILES" "$TMP_SYMBOLS" "$BASE_MODEL_FILE"
 
 echo "Generated baseline Unikraft model: $MODEL_FILE"
 echo "Generated baseline Unikraft RSF: $RSF_FILE"

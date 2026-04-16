@@ -1,0 +1,243 @@
+#!/usr/bin/env python2
+"""Generate baseline RSF from Unikraft Config.uk/Kconfig files."""
+
+import os
+import re
+import sys
+
+TYPE_MAP = {
+    'bool': 'boolean',
+    'boolean': 'boolean',
+    'tristate': 'tristate',
+    'string': 'string',
+    'hex': 'hex',
+    'int': 'integer',
+    'integer': 'integer',
+}
+
+RE_CONFIG = re.compile(r'^\s*(config|menuconfig)\s+([A-Za-z0-9_]+)\s*$')
+RE_CHOICE = re.compile(r'^\s*choice(?:\s+([A-Za-z0-9_]+))?\s*$')
+RE_ENDCHOICE = re.compile(r'^\s*endchoice\s*$')
+RE_TYPE = re.compile(r'^\s*(bool|boolean|tristate|string|hex|int|integer)\b(.*)$')
+RE_DEPENDS = re.compile(r'^\s*depends\s+on\s+(.+)$')
+RE_DEFAULT = re.compile(r'^\s*default\s+(.+)$')
+RE_SELECT = re.compile(r'^\s*select\s+([A-Za-z0-9_]+)(?:\s+if\s+(.+))?\s*$')
+RE_PROMPT = re.compile(r'^\s*prompt\s+"')
+RE_OPTIONAL = re.compile(r'^\s*optional\s*$')
+
+
+def _strip_comments(line):
+    # Keep this simple and safe: drop everything after '#'.
+    idx = line.find('#')
+    if idx >= 0:
+        return line[:idx]
+    return line
+
+
+def _join_lines(path):
+    out = []
+    with open(path, 'r') as fobj:
+        buf = ''
+        for raw in fobj:
+            line = _strip_comments(raw.rstrip('\n'))
+            if not line and not buf:
+                continue
+            if line.endswith('\\'):
+                buf += line[:-1] + ' '
+                continue
+            line = buf + line
+            buf = ''
+            out.append(line)
+        if buf:
+            out.append(buf)
+    return out
+
+
+def _parse_default(default_text):
+    parts = default_text.split(' if ', 1)
+    state = parts[0].strip()
+    cond = 'y'
+    if len(parts) > 1:
+        cond = parts[1].strip()
+    if not state:
+        return None
+    return (state, cond if cond else 'y')
+
+
+def _to_rsf_expr(expr):
+    return expr.strip() if expr else 'y'
+
+
+def _new_symbol():
+    return {
+        'type': None,
+        'depends': [],
+        'defaults': [],
+        'selects': [],
+        'prompts': 0,
+    }
+
+
+def parse_kconfig_files(root_dir):
+    symbols = {}
+    choices = []
+    choice_counter = 0
+
+    paths = []
+    for base, dirs, files in os.walk(root_dir):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        if 'build' in dirs:
+            dirs.remove('build')
+        for name in files:
+            if name == 'Config.uk' or name.startswith('Kconfig'):
+                paths.append(os.path.join(base, name))
+    paths.sort()
+
+    current_sym = None
+    current_choice = None
+
+    for path in paths:
+        for line in _join_lines(path):
+            if not line.strip():
+                continue
+
+            m = RE_ENDCHOICE.match(line)
+            if m:
+                current_choice = None
+                current_sym = None
+                continue
+
+            m = RE_CHOICE.match(line)
+            if m:
+                choice_counter += 1
+                cname = m.group(1) or ('CHOICE_%d' % choice_counter)
+                current_choice = {
+                    'name': cname,
+                    'required': 'required',
+                    'type': 'boolean',
+                    'items': [],
+                }
+                choices.append(current_choice)
+                current_sym = None
+                continue
+
+            m = RE_CONFIG.match(line)
+            if m:
+                current_sym = m.group(2)
+                if current_sym not in symbols:
+                    symbols[current_sym] = _new_symbol()
+                if current_choice is not None:
+                    current_choice['items'].append(current_sym)
+                continue
+
+            if current_choice is not None:
+                if RE_OPTIONAL.match(line):
+                    current_choice['required'] = 'optional'
+                    continue
+                m = RE_TYPE.match(line)
+                if m:
+                    current_choice['type'] = TYPE_MAP.get(m.group(1), 'boolean')
+                    continue
+
+            if current_sym is None:
+                continue
+
+            entry = symbols[current_sym]
+
+            m = RE_TYPE.match(line)
+            if m:
+                entry['type'] = TYPE_MAP.get(m.group(1), 'boolean')
+                rest = m.group(2).strip()
+                if '"' in rest:
+                    entry['prompts'] = 1
+                continue
+
+            m = RE_PROMPT.match(line)
+            if m:
+                entry['prompts'] = 1
+                continue
+
+            m = RE_DEPENDS.match(line)
+            if m:
+                dep = _to_rsf_expr(m.group(1))
+                if dep and dep not in entry['depends']:
+                    entry['depends'].append(dep)
+                continue
+
+            m = RE_DEFAULT.match(line)
+            if m:
+                parsed = _parse_default(m.group(1))
+                if parsed and parsed not in entry['defaults']:
+                    entry['defaults'].append(parsed)
+                continue
+
+            m = RE_SELECT.match(line)
+            if m:
+                target = m.group(1)
+                cond = _to_rsf_expr(m.group(2) if m.group(2) else 'y')
+                item = (target, cond)
+                if item not in entry['selects']:
+                    entry['selects'].append(item)
+                continue
+
+    for sym in symbols:
+        if not symbols[sym]['type']:
+            symbols[sym]['type'] = 'boolean'
+
+    return symbols, choices
+
+
+def write_rsf(out_path, symbols, choices):
+    with open(out_path, 'w') as out:
+        out.write('# Auto-generated RSF for Unikraft\n')
+
+        for sym in sorted(symbols):
+            meta = symbols[sym]
+            out.write('Item\t%s\t%s\n' % (sym, meta['type']))
+            out.write('HasPrompts\t%s\t%d\n' % (sym, 1 if meta['prompts'] else 0))
+            for dep in meta['depends']:
+                out.write('Depends\t%s\t"%s"\n' % (sym, dep.replace('"', '\\"')))
+            for state, cond in meta['defaults']:
+                out.write('Default\t%s\t"%s"\t"%s"\n' % (
+                    sym,
+                    state.replace('"', '\\"'),
+                    cond.replace('"', '\\"'),
+                ))
+            for target, cond in meta['selects']:
+                out.write('ItemSelects\t%s\t%s\t"%s"\n' % (
+                    sym,
+                    target,
+                    cond.replace('"', '\\"'),
+                ))
+
+        for choice in choices:
+            out.write('Choice\t%s\t%s\t%s\n' % (
+                choice['name'],
+                choice['required'],
+                choice['type'],
+            ))
+            for item in choice['items']:
+                out.write('ChoiceItem\t%s\t%s\n' % (choice['name'], item))
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.stderr.write('Usage: %s <source_root> <output.rsf>\n' % argv[0])
+        return 1
+
+    source_root = argv[1]
+    output_rsf = argv[2]
+
+    symbols, choices = parse_kconfig_files(source_root)
+    write_rsf(output_rsf, symbols, choices)
+    sys.stdout.write('Generated RSF with %d symbols and %d choices: %s\n' % (
+        len(symbols),
+        len(choices),
+        output_rsf,
+    ))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
