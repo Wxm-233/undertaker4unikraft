@@ -159,7 +159,7 @@ class _02_UnikraftObjects(Linux._02_LinuxObjects):
         super(_02_UnikraftObjects, self).__init__(model, arch)
 
 
-class _02_UnikraftLibrarySrcs(BaseClasses.Pass):
+class _02_UnikraftLibrarySrcs(BaseClasses.DuringPass):
     """Extract source files from LIBXXX_SRCS-y and LIBXXX_SRCS-$(CONFIG_*) patterns."""
 
     # Pattern: LIBXXX_SRCS-y += file.c or LIBXXX_SRCS-$(CONFIG_FOO) += file.c

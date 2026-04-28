@@ -69,20 +69,6 @@ TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
 TMP_MODEL_SYMBOLS="$MODELS/$ARCH.model.symbols.base.tmp"
 TMP_EXTRA_SYMBOLS="$MODELS/$ARCH.model.symbols.extra.tmp"
 
-CONFIG_FILE=""
-for candidate in "build/config" ".config"; do
-    if [ -f "$candidate" ]; then
-        CONFIG_FILE="$candidate"
-        break
-    fi
-done
-
-if [ -z "$CONFIG_FILE" ]; then
-    echo "No configuration file found (expected build/config or .config)."
-    echo "Run a Unikraft configure/build step first, then rerun this command."
-    exit 1
-fi
-
 CCDB_FILE=""
 for candidate in "build/compile_commands.json" "compile_commands.json"; do
     if [ -f "$candidate" ]; then
@@ -135,19 +121,6 @@ awk '
 }
 ' "$RSF_FILE" | sort -u > "$TMP_SYMBOLS"
 
-# Merge with symbols from the active configuration.
-awk -F= '
-/^CONFIG_[A-Za-z0-9_]+=(y|m)$/ {
-    print $1
-    if ($2 == "m")
-        print $1 "_MODULE"
-}
-' "$CONFIG_FILE" | sort -u > "$TMP_SYMBOLS.active"
-
-cat "$TMP_SYMBOLS" "$TMP_SYMBOLS.active" | sort -u > "$TMP_SYMBOLS.merged"
-mv "$TMP_SYMBOLS.merged" "$TMP_SYMBOLS"
-rm -f "$TMP_SYMBOLS.active"
-
 # Build FILE_* inferences from compile_commands if available.
 : > "$TMP_FILES"
 if [ -n "$CCDB_FILE" ]; then
@@ -194,12 +167,6 @@ if ! grep -q '^UNDERTAKER_SET CONFIGURATION_SPACE_REGEX' "$BASE_MODEL_FILE"; the
     mv "$BASE_MODEL_FILE.withregex" "$BASE_MODEL_FILE"
 fi
 
-# Ensure symbols from the active config are present even if RSF extraction misses some.
-grep -E '^CONFIG_[A-Za-z0-9_]+' "$BASE_MODEL_FILE" | awk '{print $1}' | sort -u > "$TMP_MODEL_SYMBOLS"
-comm -23 "$TMP_SYMBOLS" "$TMP_MODEL_SYMBOLS" > "$TMP_EXTRA_SYMBOLS"
-cat "$TMP_EXTRA_SYMBOLS" >> "$BASE_MODEL_FILE"
-rm -f "$TMP_MODEL_SYMBOLS" "$TMP_EXTRA_SYMBOLS"
-
 # Create a provisional model for minigolem.
 cp "$BASE_MODEL_FILE" "$MODEL_FILE"
 
@@ -241,4 +208,4 @@ echo "Generated baseline Unikraft RSF: $RSF_FILE"
 if [ -n "$CCDB_FILE" ]; then
     echo "Included FILE_ entries from: $CCDB_FILE"
 fi
-echo "Configuration source: $CONFIG_FILE"
+echo "Configuration source: RSF + compile_commands + Makefile.uk scans"
