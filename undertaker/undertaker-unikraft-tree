@@ -160,13 +160,22 @@ fi
 
 make_worklist() {
     local output_file="$1"
-    find -type f \( -name '*.[hcS]' -o -name '*.h' \) \
-        ! -path './build/*' ! -path './.git/*' ! -path './.git' \
+    local include_headers="${2:-yes}"
+
+    if [ "$include_headers" = "yes" ]; then
+        find -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.S' -o -name '*.h' \) \
+            ! -path './build/*' ! -path './.git/*' ! -path './.git' \
+            -exec grep -q -E '^#[[:space:]]*if|^#[[:space:]]*else' {} \; -print | shuf > "$output_file"
+        return
+    fi
+
+    find -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.S' \) \
+        ! -path './build/*' ! -path './.git/*' ! -path './.git' ! -path './support/*' \
         -exec grep -q -E '^#[[:space:]]*if|^#[[:space:]]*else' {} \; -print | shuf > "$output_file"
 }
 
 if [ "$MODE" = "calc-coverage" ]; then
-    make_worklist undertaker-unikraft-coverage-worklist
+    make_worklist undertaker-unikraft-coverage-worklist no
 
     files=$(wc -l < undertaker-unikraft-coverage-worklist)
     echo "Calculating partial configurations (greedy variant) on $files files"
