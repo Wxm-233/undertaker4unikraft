@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Convert the simplified Unikraft RSF dump into an Undertaker .model file."""
+"""Convert the simplified Unikraft RSF dump into an Undertaker .model file.
+
+The regular Linux rsf2model pipeline is too tied to Linux Kconfig
+assumptions for Unikraft.  This converter intentionally keeps the model
+permissive, but still records the constraints that are important for
+undertaker coverage: symbol dependencies and select implications.
+"""
 
 import re
 import sys
@@ -8,11 +14,15 @@ from collections import defaultdict
 
 RE_ITEM = re.compile(r'^Item\s+(\S+)\s+(\S+)')
 RE_DEPENDS = re.compile(r'^Depends\s+(\S+)\s+"(.*)"')
+RE_SELECT = re.compile(r'^ItemSelects\s+(\S+)\s+(\S+)\s+"(.*)"')
+TOKEN_RE = re.compile(r'\b[A-Za-z_][A-Za-z0-9_]*\b')
+LOWER_WORD_RE = re.compile(r'\b[a-z][A-Za-z0-9_]*\b')
 
 
 def read_rsf(path):
     items = {}
     depends = defaultdict(list)
+    selects = defaultdict(list)
 
     with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
         for line in fd:
@@ -25,8 +35,13 @@ def read_rsf(path):
             match = RE_DEPENDS.match(line)
             if match:
                 depends[match.group(1)].append(match.group(2))
+                continue
 
-    return items, depends
+            match = RE_SELECT.match(line)
+            if match:
+                selects[match.group(1)].append((match.group(2), match.group(3)))
+
+    return items, depends, selects
 
 
 def model_symbol(symbol):
@@ -35,23 +50,50 @@ def model_symbol(symbol):
     return 'CONFIG_' + symbol
 
 
+def looks_like_kconfig_symbol(token):
+    return token.isupper() and re.match(r'^[A-Z0-9_]+$', token)
+
+
 def convert_expr(expr, items):
+    expr = expr.strip()
+    if not expr:
+        return None
+
+    # kconfiglib can carry human-readable dependency text through custom
+    # prompt expressions. Undertaker cannot parse those phrases as Boolean
+    # formulae, so ignore them instead of poisoning the model slice.
+    for token in LOWER_WORD_RE.findall(expr):
+        if token not in ('y', 'm', 'n'):
+            return None
+
     def replace(match):
         token = match.group(0)
-        if token in ('y', 'm', 'n'):
-            return 'CONFIG_' + token
-        if token in items:
+        if token == 'y':
+            return 'CONFIG_y'
+        if token == 'm':
+            return 'CONFIG_m'
+        if token == 'n':
+            return 'CONFIG_n'
+        if token in items or looks_like_kconfig_symbol(token):
             return model_symbol(token)
         return token
 
-    return re.sub(r'\b[A-Za-z_][A-Za-z0-9_]*\b', replace, expr)
-
-
-def parenthesize(expr):
-    expr = expr.strip()
-    if not expr or expr == 'CONFIG_y':
+    converted = TOKEN_RE.sub(replace, expr)
+    converted = converted.strip()
+    if not converted or converted == 'CONFIG_y':
         return None
-    return '(' + expr + ')'
+    return converted
+
+
+def add_unique(parts, expr):
+    if expr and expr not in parts:
+        parts.append(expr)
+
+
+def implication(condition, target):
+    if not condition:
+        return target
+    return '(!({}) || {})'.format(condition, target)
 
 
 def main(argv):
@@ -59,23 +101,29 @@ def main(argv):
         print('Usage: {} <input.rsf>'.format(argv[0]), file=sys.stderr)
         return 1
 
-    items, depends = read_rsf(argv[1])
+    items, depends, selects = read_rsf(argv[1])
 
     print('I: Items-Count: {}'.format(len(items)))
     print('I: Format: <variable> [presence condition]')
+    print('UNDERTAKER_SET SCHEMA_VERSION 1.1')
     print('UNDERTAKER_SET CONFIGURATION_SPACE_REGEX "CONFIG_.*"')
+    print('UNDERTAKER_SET ALWAYS_ON "CONFIG_y"')
+    print('UNDERTAKER_SET ALWAYS_OFF "CONFIG_n"')
 
     for item in sorted(items):
         symbol = model_symbol(item)
         parts = []
+
         for dep in depends.get(item, []):
-            converted = parenthesize(convert_expr(dep, items))
-            if converted and converted not in parts:
-                parts.append(converted)
+            add_unique(parts, convert_expr(dep, items))
+
+        for selected, condition in selects.get(item, []):
+            selected_symbol = model_symbol(selected)
+            converted_condition = convert_expr(condition, items)
+            add_unique(parts, implication(converted_condition, selected_symbol))
 
         if parts:
-            parts.append(symbol)
-            print('{} "{}"'.format(symbol, ' && '.join(parts)))
+            print('{} "{}"'.format(symbol, ' && '.join('({})'.format(p) for p in parts)))
         else:
             print(symbol)
 

@@ -166,7 +166,10 @@ write_fallback_model() {
     } > "$BASE_MODEL_FILE"
 }
 
-if [ -n "$RSF2MODEL" ]; then
+if [ -f "$UK_RSF2MODEL" ] && command -v python3 >/dev/null 2>&1 \
+        && python3 "$UK_RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE"; then
+    mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
+elif [ -n "$RSF2MODEL" ]; then
     if command -v python2 >/dev/null 2>&1; then
         python2 "$RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE" 2>"$MODELS/$ARCH.rsf2model-errors" || true
     else
@@ -176,21 +179,13 @@ if [ -n "$RSF2MODEL" ]; then
     if [ -s "$TMP_BASE_CANDIDATE" ]; then
         mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
         rm -f "$MODELS/$ARCH.rsf2model-errors"
-    elif [ -f "$UK_RSF2MODEL" ] && command -v python3 >/dev/null 2>&1 \
-            && python3 "$UK_RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE"; then
-        mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
-        rm -f "$MODELS/$ARCH.rsf2model-errors"
     else
         echo "Warning: rsf2model failed or produced an empty model; falling back to declared-symbol model." >&2
         write_fallback_model
     fi
-elif [ -f "$UK_RSF2MODEL" ] && command -v python3 >/dev/null 2>&1 \
-        && python3 "$UK_RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE"; then
-    mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
 else
     write_fallback_model
 fi
-
 if ! grep -q '^UNDERTAKER_SET CONFIGURATION_SPACE_REGEX' "$BASE_MODEL_FILE"; then
     {
         echo "UNDERTAKER_SET CONFIGURATION_SPACE_REGEX \"CONFIG_.*\""

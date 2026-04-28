@@ -182,7 +182,7 @@ if [ "$MODE" = "calc-coverage" ]; then
 
     "$UNDERTAKER_CMD" -k -v -j coverage -C min -t "$PROCESSORS" \
         -b undertaker-unikraft-coverage-worklist \
-        -m "$MODELS" -M "$DEFAULT_ARCH" 2>&1 | grep '^I: ./' > coverage.txt
+        -m "$MODELS" -M "$DEFAULT_ARCH" 2>&1 | grep '^I: .*Found Solutions:' > coverage.txt
 
     if [ ! -s coverage.txt ]; then
         echo "Coverage analysis failed!"
