@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+Extract source file -> CONFIG condition mappings from Unikraft Makefile.uk files.
+
+This complements undertaker-unikraft-kconfigdump by extracting the missing FILE_* 
+preconditions that minigolem fails to generate.
+
+Usage:
+    undertaker-unikraft-srcsdump <root_dir> <output_rsf>
+"""
+
+import sys
+import os
+import re
+from collections import defaultdict
+
+
+def extract_lib_srcs(root_dir):
+    """
+    Scan Makefile.uk files and extract LIBXXX_SRCS-* patterns.
+    
+    Returns dict: {file_path: [condition_list]}
+    where each condition is a tuple like ('y',) for unconditional or ('$(CONFIG_FOO)',) for conditional.
+    """
+    file_conditions = defaultdict(list)
+    lib_vars = {}  # Track LIBXXX_BASE variables for path expansion
+
+    # Pattern: LIBXXX_SRCS-condition += files
+    lib_srcs_pattern = re.compile(
+        r'^\s*(\w+)_SRCS-([ym]|\$\(CONFIG_\w+\)|\$\{CONFIG_\w+\})\s*[:+]?=\s*(.+)$',
+        re.MULTILINE
+    )
+
+    # Pattern: LIBXXX_BASE = path
+    lib_base_pattern = re.compile(r'^\s*(\w+)_BASE\s*=\s*(.+)$', re.MULTILINE)
+
+    # Walk all Makefile.uk files
+    file_count = 0
+    match_count = 0
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Skip build and git directories
+        dirnames[:] = [d for d in dirnames if d not in ['build', '.git', '__pycache__']]
+
+        for filename in filenames:
+            if filename in ['Makefile.uk', 'Makefile']:
+                filepath = os.path.join(dirpath, filename)
+                file_count += 1
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                except Exception as e:
+                    print(f"Warning: Could not read {filepath}: {e}", file=sys.stderr)
+                    continue
+
+                # Extract LIBXXX_BASE definitions
+                for match in lib_base_pattern.finditer(content):
+                    lib_var = match.group(1)
+                    lib_path = match.group(2).strip()
+                    lib_vars[lib_var + '_BASE'] = lib_path
+
+                # Extract LIBXXX_SRCS-* assignments
+                for match in lib_srcs_pattern.finditer(content):
+                    match_count += 1
+                    lib_prefix = match.group(1)  # e.g., LIBUKALLOC
+                    condition_str = match.group(2)  # e.g., 'y' or '$(CONFIG_FOO)'
+                    files_str = match.group(3)  # e.g., '$(LIBUKALLOC_BASE)/alloc.c'
+
+                    # Normalize condition
+                    if condition_str == 'y':
+                        condition = None  # unconditional
+                    elif condition_str == 'm':
+                        condition = 'MODULE'
+                    else:
+                        # Extract CONFIG variable
+                        config_match = re.search(r'CONFIG_\w+', condition_str)
+                        if config_match:
+                            condition = config_match.group(0)
+                        else:
+                            condition = condition_str
+
+                    # Parse file list (split on whitespace and handle $(VAR))
+                    files = files_str.split()
+                    for file_ref in files:
+                        file_ref = file_ref.strip()
+                        if not file_ref:
+                            continue
+
+                        orig_ref = file_ref
+                        # Expand $(VAR) references
+                        for var_name, var_value in lib_vars.items():
+                            file_ref = file_ref.replace('$(' + var_name + ')', var_value)
+                            file_ref = file_ref.replace('${' + var_name + '}', var_value)
+
+                        # Skip if still has unexpanded variables (only output this line for debugging)
+                        # print(f"  File ref: {orig_ref} -> {file_ref}", file=sys.stderr)
+                        if '$(' in file_ref or '${' in file_ref:
+                            # Try to extract the variable name and use a default path
+                            var_match = re.search(r'\$[\(\{](\w+)_BASE[\)\}]', file_ref)
+                            if var_match:
+                                # Assume lib/libname/ or lib/XYZ/ based on variable name
+                                lib_name = var_match.group(1).lower()
+                                # Convert LIBUKALLOC to libukalloc or similar
+                                if lib_name.startswith('lib'):
+                                    default_base = f"lib/{lib_name[3:]}"
+                                else:
+                                    default_base = f"lib/{lib_name}"
+                                file_ref = file_ref.replace(var_match.group(0), default_base)
+                            else:
+                                # Can't resolve, skip
+                                continue
+
+                        # Filter to source files
+                        if file_ref.endswith(('.c', '.cpp', '.cc', '.cxx', '.h', '.ld', '.S')):
+                            # Normalize path (remove ./)
+                            if file_ref.startswith('./'):
+                                file_ref = file_ref[2:]
+
+                            # Add condition
+                            if file_ref not in file_conditions:
+                                file_conditions[file_ref] = []
+                            if condition:
+                                file_conditions[file_ref].append(condition)
+    
+    print(f"Debug: Scanned {file_count} Makefile* files, found {match_count} SRCS patterns", file=sys.stderr)
+
+    return file_conditions
+
+
+def main(argc, argv):
+    if len(argv) < 3:
+        print("Usage: {} <root_dir> <output_file>".format(argv[0]), file=sys.stderr)
+        sys.exit(1)
+
+    root_dir = argv[1]
+    output_file = argv[2]
+
+    if not os.path.isdir(root_dir):
+        print("Error: {} is not a directory".format(root_dir), file=sys.stderr)
+        sys.exit(1)
+
+    # Extract source file conditions
+    file_conditions = extract_lib_srcs(root_dir)
+
+    # Write output in precondition format: FILE_path<tab>CONFIG_condition
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for file_path in sorted(file_conditions.keys()):
+                conditions = file_conditions[file_path]
+                if not conditions:
+                    # Unconditional file
+                    f.write("FILE_{}\n".format(file_path))
+                else:
+                    # Conditional file - output all conditions
+                    for cond in sorted(set(conditions)):
+                        f.write("FILE_{} {}\n".format(file_path, cond))
+
+        print("Extracted {} source files from {} into {}".format(
+            len(file_conditions), root_dir, output_file), file=sys.stderr)
+        sys.exit(0)
+
+    except Exception as e:
+        print("Error writing output: {}".format(e), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main(len(sys.argv), sys.argv)

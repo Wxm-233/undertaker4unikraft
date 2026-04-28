@@ -159,6 +159,95 @@ class _02_UnikraftObjects(Linux._02_LinuxObjects):
         super(_02_UnikraftObjects, self).__init__(model, arch)
 
 
+class _02_UnikraftLibrarySrcs(BaseClasses.Pass):
+    """Extract source files from LIBXXX_SRCS-y and LIBXXX_SRCS-$(CONFIG_*) patterns."""
+
+    # Pattern: LIBXXX_SRCS-y += file.c or LIBXXX_SRCS-$(CONFIG_FOO) += file.c
+    lib_srcs_line = r"\s*(\w+)_SRCS-([y|m]|\$[\(\{]" + Linux.CONFIG_FORMAT + r"[\)\}])\s*(:=|\+=|=)\s*(.+)"
+    regex_lib_srcs = re.compile(lib_srcs_line)
+
+    def __init__(self, model, arch):
+        super(_02_UnikraftLibrarySrcs, self).__init__(model, arch)
+
+    def process(self, parser, line, basepath):
+        _line = line.processed_line
+        if not _line or _line.startswith("#"):
+            return False
+
+        match = self.regex_lib_srcs.match(_line)
+        if not match:
+            return False
+
+        lib_prefix = match.group(1)  # e.g., "LIBUKALLOC"
+        condition_str = match.group(2)  # e.g., "y" or "$(CONFIG_X)"
+        files_str = match.group(4)  # e.g., "$(LIBUKALLOC_BASE)/alloc.c $(LIBUKALLOC_BASE)/stats.c"
+
+        # Determine the actual condition
+        if condition_str == "y":
+            condition = DataStructures.Precondition()
+        elif condition_str == "m":
+            condition = DataStructures.Precondition()
+            condition.add_condition("MODULE")
+        else:
+            # Extract CONFIG variable from $(CONFIG_XXX)
+            config_match = re.search(r'\$[\(\{](' + Linux.CONFIG_FORMAT + r')[\)\}]', condition_str)
+            if config_match:
+                config_var = config_match.group(1)
+                condition = DataStructures.Precondition()
+                condition.add_condition(config_var)
+            else:
+                return False
+
+        # Parse file list (handle $(VAR) expansions)
+        files = re.findall(r'[\$\w\.\-/(){}]+', files_str)
+        for file_path in files:
+            file_path = file_path.strip()
+            if not file_path:
+                continue
+
+            # Try to expand $(VAR) references
+            # Common patterns: $(LIBXXX_BASE), $(ARCH_BASE), etc.
+            if '$(LIBNAME_BASE)' in file_path:
+                # This is a generic placeholder, need proper resolution
+                continue
+            elif '$(' in file_path:
+                # Try to substitute from parser.local_vars
+                var_name = re.search(r'\$\((\w+)\)', file_path)
+                if var_name:
+                    var = var_name.group(1)
+                    if var in parser.local_vars:
+                        file_path = file_path.replace('$(' + var + ')', parser.local_vars[var])
+                    elif var in parser.global_vars:
+                        file_path = file_path.replace('$(' + var + ')', parser.global_vars[var])
+
+            # Add source object to the model
+            if file_path and (file_path.endswith('.c') or file_path.endswith('.ld')):
+                # Normalize path (remove leading ./)
+                if file_path.startswith('./'):
+                    file_path = file_path[2:]
+
+                # Create a combined condition: library enable AND file condition
+                combined_condition = DataStructures.Precondition()
+                # Assume library is gated by CONFIG_LIB* which will be resolved later
+                combined_condition.add_condition(condition)
+
+                # Store the file association
+                if hasattr(self, 'file_conditions'):
+                    if file_path not in self.file_conditions:
+                        self.file_conditions[file_path] = []
+                    self.file_conditions[file_path].append(combined_condition)
+                else:
+                    self.file_conditions = {file_path: [combined_condition]}
+
+                logging.debug(
+                    "Unikraft source: LIB=%s FILE=%s CONDITION=%s",
+                    lib_prefix, file_path, condition
+                )
+
+        line.invalid = False
+        return True
+
+
 class _01_UnikraftExpandMacros(Linux._01_LinuxExpandMacros):
     """Macro expansion stage for Unikraft makefiles."""
 

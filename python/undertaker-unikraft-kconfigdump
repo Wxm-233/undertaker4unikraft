@@ -63,6 +63,7 @@ RSF_FILE="$MODELS/$ARCH.rsf"
 BASE_MODEL_FILE="$MODELS/$ARCH.model.base.tmp"
 TMP_BODY="$MODELS/$ARCH.model.body.tmp"
 TMP_MINIGOLEM="$MODELS/$ARCH.preconditions.tmp"
+TMP_SRCSDUMP="$MODELS/$ARCH.preconditions.srcs.tmp"
 TMP_FILES="$MODELS/$ARCH.model.files.tmp"
 TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
 TMP_MODEL_SYMBOLS="$MODELS/$ARCH.model.symbols.base.tmp"
@@ -209,13 +210,31 @@ if which minigolem >/dev/null 2>&1; then
     fi
 fi
 
-cat "$TMP_MINIGOLEM" >> "$TMP_BODY"
+# Supplement with direct source file extraction from Makefile.uk.
+: > "$TMP_SRCSDUMP"
+SRCS_DUMPER="$SCRIPT_DIR/undertaker-unikraft-srcsdump"
+if [ ! -x "$SRCS_DUMPER" ]; then
+    SRCS_DUMPER=$(which undertaker-unikraft-srcsdump || true)
+fi
+
+if [ -x "$SRCS_DUMPER" ]; then
+    if ! "$SRCS_DUMPER" . "$TMP_SRCSDUMP" 2>/dev/null; then
+        : # Fallback to just minigolem output
+    fi
+elif which python3 >/dev/null 2>&1; then
+    # Try direct Python execution as fallback
+    if ! python3 "$SCRIPT_DIR/undertaker-unikraft-srcsdump" . "$TMP_SRCSDUMP" 2>/dev/null; then
+        : # Fallback to just minigolem output
+    fi
+fi
+
+cat "$TMP_MINIGOLEM" "$TMP_SRCSDUMP" >> "$TMP_BODY"
 sort -u "$TMP_BODY" > "$TMP_BODY.sorted"
 
 cp "$BASE_MODEL_FILE" "$MODEL_FILE"
 cat "$TMP_BODY.sorted" >> "$MODEL_FILE"
 
-rm -f "$TMP_BODY" "$TMP_BODY.sorted" "$TMP_MINIGOLEM" "$TMP_FILES" "$TMP_SYMBOLS" "$BASE_MODEL_FILE"
+rm -f "$TMP_BODY" "$TMP_BODY.sorted" "$TMP_MINIGOLEM" "$TMP_SRCSDUMP" "$TMP_FILES" "$TMP_SYMBOLS" "$BASE_MODEL_FILE"
 
 echo "Generated baseline Unikraft model: $MODEL_FILE"
 echo "Generated baseline Unikraft RSF: $RSF_FILE"
