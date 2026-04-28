@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Convert the simplified Unikraft RSF dump into an Undertaker .model file."""
+
+import re
+import sys
+from collections import defaultdict
+
+
+RE_ITEM = re.compile(r'^Item\s+(\S+)\s+(\S+)')
+RE_DEPENDS = re.compile(r'^Depends\s+(\S+)\s+"(.*)"')
+
+
+def read_rsf(path):
+    items = {}
+    depends = defaultdict(list)
+
+    with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
+        for line in fd:
+            line = line.strip()
+            match = RE_ITEM.match(line)
+            if match:
+                items[match.group(1)] = match.group(2)
+                continue
+
+            match = RE_DEPENDS.match(line)
+            if match:
+                depends[match.group(1)].append(match.group(2))
+
+    return items, depends
+
+
+def model_symbol(symbol):
+    if symbol.startswith('CONFIG_'):
+        return symbol
+    return 'CONFIG_' + symbol
+
+
+def convert_expr(expr, items):
+    def replace(match):
+        token = match.group(0)
+        if token in ('y', 'm', 'n'):
+            return 'CONFIG_' + token
+        if token in items:
+            return model_symbol(token)
+        return token
+
+    return re.sub(r'\b[A-Za-z_][A-Za-z0-9_]*\b', replace, expr)
+
+
+def parenthesize(expr):
+    expr = expr.strip()
+    if not expr or expr == 'CONFIG_y':
+        return None
+    return '(' + expr + ')'
+
+
+def main(argv):
+    if len(argv) != 2:
+        print('Usage: {} <input.rsf>'.format(argv[0]), file=sys.stderr)
+        return 1
+
+    items, depends = read_rsf(argv[1])
+
+    print('I: Items-Count: {}'.format(len(items)))
+    print('I: Format: <variable> [presence condition]')
+    print('UNDERTAKER_SET CONFIGURATION_SPACE_REGEX "CONFIG_.*"')
+
+    for item in sorted(items):
+        symbol = model_symbol(item)
+        parts = []
+        for dep in depends.get(item, []):
+            converted = parenthesize(convert_expr(dep, items))
+            if converted and converted not in parts:
+                parts.append(converted)
+
+        if parts:
+            parts.append(symbol)
+            print('{} "{}"'.format(symbol, ' && '.join(parts)))
+        else:
+            print(symbol)
+
+        if items[item] == 'tristate':
+            module_symbol = symbol + '_MODULE'
+            print('{} "{}"'.format(module_symbol, symbol))
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

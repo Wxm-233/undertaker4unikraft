@@ -18,6 +18,8 @@ TYPE_MAP = {
 RE_CONFIG = re.compile(r'^\s*(config|menuconfig)\s+([A-Za-z0-9_]+)\s*$')
 RE_CHOICE = re.compile(r'^\s*choice(?:\s+([A-Za-z0-9_]+))?\s*$')
 RE_ENDCHOICE = re.compile(r'^\s*endchoice\s*$')
+RE_IF = re.compile(r'^\s*if\s+(.+)$')
+RE_ENDIF = re.compile(r'^\s*endif(?:\s+#.*)?\s*$')
 RE_TYPE = re.compile(r'^\s*(bool|boolean|tristate|string|hex|int|integer)\b(.*)$')
 RE_DEPENDS = re.compile(r'^\s*depends\s+on\s+(.+)$')
 RE_DEFAULT = re.compile(r'^\s*default\s+(.+)$')
@@ -68,6 +70,20 @@ def _to_rsf_expr(expr):
     return expr.strip() if expr else 'y'
 
 
+def _combine_expr(*exprs):
+    parts = []
+    for expr in exprs:
+        expr = _to_rsf_expr(expr)
+        if not expr or expr == 'y':
+            continue
+        parts.append(expr)
+    if not parts:
+        return 'y'
+    if len(parts) == 1:
+        return parts[0]
+    return ' && '.join('(%s)' % part for part in parts)
+
+
 def _new_symbol():
     return {
         'type': None,
@@ -75,6 +91,7 @@ def _new_symbol():
         'defaults': [],
         'selects': [],
         'prompts': 0,
+        'ifdeps_added': False,
     }
 
 
@@ -96,10 +113,24 @@ def parse_kconfig_files(root_dir):
 
     current_sym = None
     current_choice = None
+    if_stack = []
 
     for path in paths:
         for line in _join_lines(path):
             if not line.strip():
+                continue
+
+            m = RE_IF.match(line)
+            if m:
+                if_stack.append(_to_rsf_expr(m.group(1)))
+                current_sym = None
+                continue
+
+            m = RE_ENDIF.match(line)
+            if m:
+                if if_stack:
+                    if_stack.pop()
+                current_sym = None
                 continue
 
             m = RE_ENDCHOICE.match(line)
@@ -127,6 +158,9 @@ def parse_kconfig_files(root_dir):
                 current_sym = m.group(2)
                 if current_sym not in symbols:
                     symbols[current_sym] = _new_symbol()
+                if if_stack and not symbols[current_sym]['ifdeps_added']:
+                    symbols[current_sym]['depends'].append(_combine_expr(*if_stack))
+                    symbols[current_sym]['ifdeps_added'] = True
                 if current_choice is not None:
                     current_choice['items'].append(current_sym)
                 continue
@@ -160,7 +194,7 @@ def parse_kconfig_files(root_dir):
 
             m = RE_DEPENDS.match(line)
             if m:
-                dep = _to_rsf_expr(m.group(1))
+                dep = _combine_expr(m.group(1), *if_stack)
                 if dep and dep not in entry['depends']:
                     entry['depends'].append(dep)
                 continue
@@ -168,6 +202,8 @@ def parse_kconfig_files(root_dir):
             m = RE_DEFAULT.match(line)
             if m:
                 parsed = _parse_default(m.group(1))
+                if parsed and if_stack:
+                    parsed = (parsed[0], _combine_expr(parsed[1], *if_stack))
                 if parsed and parsed not in entry['defaults']:
                     entry['defaults'].append(parsed)
                 continue
@@ -175,7 +211,7 @@ def parse_kconfig_files(root_dir):
             m = RE_SELECT.match(line)
             if m:
                 target = m.group(1)
-                cond = _to_rsf_expr(m.group(2) if m.group(2) else 'y')
+                cond = _combine_expr(m.group(2) if m.group(2) else 'y', *if_stack)
                 item = (target, cond)
                 if item not in entry['selects']:
                     entry['selects'].append(item)

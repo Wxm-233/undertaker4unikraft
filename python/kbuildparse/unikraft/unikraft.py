@@ -163,11 +163,52 @@ class _02_UnikraftLibrarySrcs(BaseClasses.DuringPass):
     """Extract source files from LIBXXX_SRCS-y and LIBXXX_SRCS-$(CONFIG_*) patterns."""
 
     # Pattern: LIBXXX_SRCS-y += file.c or LIBXXX_SRCS-$(CONFIG_FOO) += file.c
-    lib_srcs_line = r"\s*(\w+)_SRCS-([y|m]|\$[\(\{]" + Linux.CONFIG_FORMAT + r"[\)\}])\s*(:=|\+=|=)\s*(.+)"
+    lib_srcs_line = r"\s*(\w+)_SRCS-([ym]|\$[\(\{]" + Linux.CONFIG_FORMAT + r"[\)\}])\s*(:=|\+=|=)\s*(.+)"
     regex_lib_srcs = re.compile(lib_srcs_line)
 
     def __init__(self, model, arch):
         super(_02_UnikraftLibrarySrcs, self).__init__(model, arch)
+
+    @staticmethod
+    def _resolve_source_path(file_path, lib_prefix, basepath):
+        """Resolve common Unikraft *_BASE source references to real source paths."""
+        if '|' in file_path:
+            file_path = file_path.split('|', 1)[0]
+        if '>' in file_path:
+            return None
+
+        base_var = "$(" + lib_prefix + "_BASE)"
+        if base_var in file_path:
+            file_path = file_path.replace(base_var, basepath)
+
+        brace_base_var = "${" + lib_prefix + "_BASE}"
+        if brace_base_var in file_path:
+            file_path = file_path.replace(brace_base_var, basepath)
+
+        config_base = os.getcwd()
+        for token in ("$(CONFIG_UK_BASE)", "${CONFIG_UK_BASE}", "$(UK_BASE)", "${UK_BASE}"):
+            file_path = file_path.replace(token, config_base)
+
+        if "$(UK_PLAT_COMMON_BASE)" in file_path:
+            file_path = file_path.replace("$(UK_PLAT_COMMON_BASE)",
+                                          os.path.join(config_base, "plat", "common"))
+
+        if "$" in file_path:
+            return None
+
+        if not os.path.isabs(file_path):
+            root_candidate = os.path.normpath(os.path.join(os.getcwd(), file_path))
+            if os.path.exists(root_candidate):
+                file_path = root_candidate
+            else:
+                file_path = os.path.normpath(os.path.join(basepath, file_path))
+
+        if not os.path.exists(file_path):
+            return None
+
+        if file_path.endswith(('.c', '.cpp', '.cc', '.cxx', '.h', '.ld', '.S')):
+            return file_path
+        return None
 
     def process(self, parser, line, basepath):
         _line = line.processed_line
@@ -205,44 +246,22 @@ class _02_UnikraftLibrarySrcs(BaseClasses.DuringPass):
             if not file_path:
                 continue
 
-            # Try to expand $(VAR) references
-            # Common patterns: $(LIBXXX_BASE), $(ARCH_BASE), etc.
-            if '$(LIBNAME_BASE)' in file_path:
-                # This is a generic placeholder, need proper resolution
+            sourcefile = self._resolve_source_path(file_path, lib_prefix, basepath)
+            if not sourcefile:
                 continue
-            elif '$(' in file_path:
-                # Try to substitute from parser.local_vars
-                var_name = re.search(r'\$\((\w+)\)', file_path)
-                if var_name:
-                    var = var_name.group(1)
-                    if var in parser.local_vars:
-                        file_path = file_path.replace('$(' + var + ')', parser.local_vars[var])
-                    elif var in parser.global_vars:
-                        file_path = file_path.replace('$(' + var + ')', parser.global_vars[var])
 
-            # Add source object to the model
-            if file_path and (file_path.endswith('.c') or file_path.endswith('.ld')):
-                # Normalize path (remove leading ./)
-                if file_path.startswith('./'):
-                    file_path = file_path[2:]
+            combined_condition = DataStructures.Precondition()
+            combined_condition.extend(line.condition)
+            combined_condition.extend(condition)
 
-                # Create a combined condition: library enable AND file condition
-                combined_condition = DataStructures.Precondition()
-                # Assume library is gated by CONFIG_LIB* which will be resolved later
-                combined_condition.add_condition(condition)
+            parser.local_vars["file_features"][sourcefile].add_alternative(
+                combined_condition[:]
+            )
 
-                # Store the file association
-                if hasattr(self, 'file_conditions'):
-                    if file_path not in self.file_conditions:
-                        self.file_conditions[file_path] = []
-                    self.file_conditions[file_path].append(combined_condition)
-                else:
-                    self.file_conditions = {file_path: [combined_condition]}
-
-                logging.debug(
-                    "Unikraft source: LIB=%s FILE=%s CONDITION=%s",
-                    lib_prefix, file_path, condition
-                )
+            logging.debug(
+                "Unikraft source: LIB=%s FILE=%s CONDITION=%s",
+                lib_prefix, sourcefile, combined_condition
+            )
 
         line.invalid = False
         return True

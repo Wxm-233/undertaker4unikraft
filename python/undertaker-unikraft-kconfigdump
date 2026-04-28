@@ -64,10 +64,12 @@ BASE_MODEL_FILE="$MODELS/$ARCH.model.base.tmp"
 TMP_BODY="$MODELS/$ARCH.model.body.tmp"
 TMP_MINIGOLEM="$MODELS/$ARCH.preconditions.tmp"
 TMP_SRCSDUMP="$MODELS/$ARCH.preconditions.srcs.tmp"
+TMP_MERGED="$MODELS/$ARCH.preconditions.merged.tmp"
 TMP_FILES="$MODELS/$ARCH.model.files.tmp"
 TMP_SYMBOLS="$MODELS/$ARCH.model.symbols.tmp"
 TMP_MODEL_SYMBOLS="$MODELS/$ARCH.model.symbols.base.tmp"
 TMP_EXTRA_SYMBOLS="$MODELS/$ARCH.model.symbols.extra.tmp"
+TMP_BASE_CANDIDATE="$MODELS/$ARCH.model.base.candidate.tmp"
 
 CCDB_FILE=""
 for candidate in "build/compile_commands.json" "compile_commands.json"; do
@@ -79,6 +81,15 @@ done
 
 ROOT_DIR=$(pwd -P)
 RSF_DUMPER="$SCRIPT_DIR/undertaker-unikraft-rsfdump"
+UK_RSF2MODEL="$SCRIPT_DIR/undertaker-unikraft-rsf2model"
+RSF2MODEL=$(which rsf2model 2>/dev/null || true)
+if [ -z "$RSF2MODEL" ] && [ -x "$SCRIPT_DIR/rsf2model" ]; then
+    RSF2MODEL="$SCRIPT_DIR/rsf2model"
+fi
+MINIGOLEM=$(which minigolem 2>/dev/null || true)
+if [ -z "$MINIGOLEM" ] && [ -x "$SCRIPT_DIR/minigolem" ]; then
+    MINIGOLEM="$SCRIPT_DIR/minigolem"
+fi
 
 if [ ! -x "$RSF_DUMPER" ]; then
     RSF_DUMPER=$(which undertaker-unikraft-rsfdump || true)
@@ -121,7 +132,7 @@ awk '
 }
 ' "$RSF_FILE" | sort -u > "$TMP_SYMBOLS"
 
-# Build FILE_* inferences from compile_commands if available.
+# Build fallback FILE_* inferences from compile_commands if available.
 : > "$TMP_FILES"
 if [ -n "$CCDB_FILE" ]; then
     grep -E '"file"[[:space:]]*:' "$CCDB_FILE" | \
@@ -144,19 +155,40 @@ if [ -n "$CCDB_FILE" ]; then
         done | sort -u > "$TMP_FILES"
 fi
 
-: > "$TMP_BODY"
-cat "$TMP_FILES" >> "$TMP_BODY"
 : > "$TMP_MINIGOLEM"
 
 # Generate a base model from RSF when possible.
-if which rsf2model >/dev/null 2>&1; then
-    rsf2model "$RSF_FILE" > "$BASE_MODEL_FILE"
-else
+write_fallback_model() {
     {
         echo "UNDERTAKER_SET SCHEMA_VERSION 1.1"
         echo "UNDERTAKER_SET ALWAYS_ON"
         cat "$TMP_SYMBOLS"
     } > "$BASE_MODEL_FILE"
+}
+
+if [ -n "$RSF2MODEL" ]; then
+    if command -v python2 >/dev/null 2>&1; then
+        python2 "$RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE" 2>"$MODELS/$ARCH.rsf2model-errors" || true
+    else
+        "$RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE" 2>"$MODELS/$ARCH.rsf2model-errors" || true
+    fi
+
+    if [ -s "$TMP_BASE_CANDIDATE" ]; then
+        mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
+        rm -f "$MODELS/$ARCH.rsf2model-errors"
+    elif [ -f "$UK_RSF2MODEL" ] && command -v python3 >/dev/null 2>&1 \
+            && python3 "$UK_RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE"; then
+        mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
+        rm -f "$MODELS/$ARCH.rsf2model-errors"
+    else
+        echo "Warning: rsf2model failed or produced an empty model; falling back to declared-symbol model." >&2
+        write_fallback_model
+    fi
+elif [ -f "$UK_RSF2MODEL" ] && command -v python3 >/dev/null 2>&1 \
+        && python3 "$UK_RSF2MODEL" "$RSF_FILE" > "$TMP_BASE_CANDIDATE"; then
+    mv "$TMP_BASE_CANDIDATE" "$BASE_MODEL_FILE"
+else
+    write_fallback_model
 fi
 
 if ! grep -q '^UNDERTAKER_SET CONFIGURATION_SPACE_REGEX' "$BASE_MODEL_FILE"; then
@@ -171,8 +203,8 @@ fi
 cp "$BASE_MODEL_FILE" "$MODEL_FILE"
 
 # Try to enrich with parser-derived file preconditions.
-if which minigolem >/dev/null 2>&1; then
-    if ! minigolem -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u > "$TMP_MINIGOLEM"; then
+if [ -n "$MINIGOLEM" ]; then
+    if ! "$MINIGOLEM" -a "$ARCH" -m "$MODEL_FILE" 2>"$MODELS/$ARCH.minigolem-errors" | sort -u > "$TMP_MINIGOLEM"; then
         echo "Warning: minigolem precondition extraction failed for $ARCH; continuing with baseline model." >&2
     fi
 fi
@@ -184,24 +216,52 @@ if [ ! -x "$SRCS_DUMPER" ]; then
     SRCS_DUMPER=$(which undertaker-unikraft-srcsdump || true)
 fi
 
-if [ -x "$SRCS_DUMPER" ]; then
-    if ! "$SRCS_DUMPER" . "$TMP_SRCSDUMP" 2>/dev/null; then
-        : # Fallback to just minigolem output
-    fi
-elif which python3 >/dev/null 2>&1; then
-    # Try direct Python execution as fallback
-    if ! python3 "$SCRIPT_DIR/undertaker-unikraft-srcsdump" . "$TMP_SRCSDUMP" 2>/dev/null; then
-        : # Fallback to just minigolem output
+if [ -f "$SRCS_DUMPER" ]; then
+    if [ -x "$SRCS_DUMPER" ] && "$SRCS_DUMPER" . "$TMP_SRCSDUMP" 2>/dev/null; then
+        :
+    elif which python3 >/dev/null 2>&1; then
+        python3 "$SRCS_DUMPER" . "$TMP_SRCSDUMP" 2>/dev/null || :
     fi
 fi
 
-cat "$TMP_MINIGOLEM" "$TMP_SRCSDUMP" >> "$TMP_BODY"
+# Merge file preconditions without letting fallback/unconditional sources erase
+# more precise Makefile.uk conditions. RsfReader keeps the first occurrence of a
+# key, so duplicate FILE_* rows must be removed before appending to the model.
+: > "$TMP_BODY"
+cat "$TMP_SRCSDUMP" > "$TMP_BODY"
+awk '
+    NR == FNR {
+        if ($1 != "")
+            seen[$1] = 1
+        print
+        next
+    }
+    !($1 in seen) {
+        seen[$1] = 1
+        print
+    }
+' "$TMP_BODY" "$TMP_MINIGOLEM" > "$TMP_MERGED"
+mv "$TMP_MERGED" "$TMP_BODY"
+awk '
+    NR == FNR {
+        if ($1 != "")
+            seen[$1] = 1
+        print
+        next
+    }
+    !($1 in seen) {
+        seen[$1] = 1
+        print
+    }
+' "$TMP_BODY" "$TMP_FILES" > "$TMP_MERGED"
+mv "$TMP_MERGED" "$TMP_BODY"
 sort -u "$TMP_BODY" > "$TMP_BODY.sorted"
 
 cp "$BASE_MODEL_FILE" "$MODEL_FILE"
 cat "$TMP_BODY.sorted" >> "$MODEL_FILE"
 
-rm -f "$TMP_BODY" "$TMP_BODY.sorted" "$TMP_MINIGOLEM" "$TMP_SRCSDUMP" "$TMP_FILES" "$TMP_SYMBOLS" "$BASE_MODEL_FILE"
+rm -f "$TMP_BODY" "$TMP_BODY.sorted" "$TMP_MINIGOLEM" "$TMP_SRCSDUMP" "$TMP_MERGED" \
+    "$TMP_FILES" "$TMP_SYMBOLS" "$BASE_MODEL_FILE" "$TMP_BASE_CANDIDATE"
 
 echo "Generated baseline Unikraft model: $MODEL_FILE"
 echo "Generated baseline Unikraft RSF: $RSF_FILE"

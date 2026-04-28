@@ -15,6 +15,135 @@ import re
 from collections import defaultdict
 
 
+SOURCE_EXTENSIONS = (
+    '.c',
+    '.cpp',
+    '.cc',
+    '.cxx',
+    '.h',
+    '.ld',
+    '.S',
+)
+
+
+def normalize_file_symbol(path):
+    """Match CppFile::getFileVar() normalization in ConditionalBlock.cpp."""
+    return path.replace('\\', '/').translate(str.maketrans({
+        '/': '_',
+        '-': '_',
+        '+': '_',
+        ':': '_',
+        ',': '_',
+    }))
+
+
+def strip_comment(line):
+    return line.split('#', 1)[0]
+
+
+def join_make_lines(content):
+    lines = []
+    buf = ''
+    for raw in content.splitlines():
+        line = strip_comment(raw).rstrip()
+        if not line and not buf:
+            continue
+        if line.endswith('\\'):
+            buf += line[:-1] + ' '
+            continue
+        lines.append((buf + line).strip())
+        buf = ''
+    if buf:
+        lines.append(buf.strip())
+    return lines
+
+
+def normalize_config_condition(condition):
+    if not condition or condition == 'y':
+        return None
+    if condition == 'm':
+        return 'CONFIG_MODULES'
+    match = re.search(r'CONFIG_\w+', condition)
+    return match.group(0) if match else condition
+
+
+def combine_conditions(*conditions):
+    parts = []
+    for cond in conditions:
+        if not cond:
+            continue
+        if isinstance(cond, (list, tuple, set)):
+            nested = combine_conditions(*cond)
+            if nested:
+                parts.append(nested)
+        else:
+            parts.append(str(cond))
+    seen = []
+    for part in parts:
+        if part not in seen:
+            seen.append(part)
+    if not seen:
+        return None
+    if len(seen) == 1:
+        return seen[0]
+    return ' && '.join('(%s)' % item if ' || ' in item else item for item in seen)
+
+
+def combine_alternatives(conditions):
+    filtered = sorted(set(cond for cond in conditions if cond))
+    if len(filtered) == 0:
+        return None
+    if len(filtered) == 1:
+        return filtered[0]
+    return ' || '.join('(%s)' % item for item in filtered)
+
+
+def resolve_vars(value, variables):
+    ret = value
+    for _ in range(16):
+        changed = False
+        for match in re.finditer(r'\$[\(\{]([A-Za-z0-9_]+)[\)\}]', ret):
+            var = match.group(1)
+            if var not in variables:
+                continue
+            ret = ret.replace(match.group(0), variables[var])
+            changed = True
+        if not changed:
+            break
+    return ret
+
+
+def relpath_from_root(path, root_dir, current_dir):
+    path = path.replace('\\', '/')
+    if '|' in path:
+        path = path.split('|', 1)[0]
+    if '>' in path:
+        return None
+    if '$(' in path or '${' in path:
+        return None
+    if not path.endswith(SOURCE_EXTENSIONS):
+        return None
+
+    if os.path.isabs(path):
+        abs_path = os.path.normpath(path)
+    else:
+        candidate = os.path.normpath(os.path.join(root_dir, path))
+        if os.path.exists(candidate):
+            abs_path = candidate
+        else:
+            abs_path = os.path.normpath(os.path.join(current_dir, path))
+
+    if not os.path.exists(abs_path):
+        return None
+
+    rel = os.path.relpath(abs_path, root_dir)
+    return rel.replace('\\', '/')
+
+
+def lib_prefix_from_addlib(name):
+    return name.upper()
+
+
 def extract_lib_srcs(root_dir):
     """
     Scan Makefile.uk files and extract LIBXXX_SRCS-* patterns.
@@ -22,21 +151,23 @@ def extract_lib_srcs(root_dir):
     Returns dict: {file_path: [condition_list]}
     where each condition is a tuple like ('y',) for unconditional or ('$(CONFIG_FOO)',) for conditional.
     """
-    file_conditions = defaultdict(list)
-    lib_vars = {}  # Track LIBXXX_BASE variables for path expansion
+    root_dir = os.path.abspath(root_dir)
+    file_conditions = defaultdict(set)
 
     # Pattern: LIBXXX_SRCS-condition += files
     lib_srcs_pattern = re.compile(
-        r'^\s*(\w+)_SRCS-([ym]|\$\(CONFIG_\w+\)|\$\{CONFIG_\w+\})\s*[:+]?=\s*(.+)$',
-        re.MULTILINE
+        r'^\s*(\w+)_SRCS-([ym]|\$\(CONFIG_\w+\)|\$\{CONFIG_\w+\})\s*[:+]?=\s*(.+)$'
     )
 
-    # Pattern: LIBXXX_BASE = path
-    lib_base_pattern = re.compile(r'^\s*(\w+)_BASE\s*=\s*(.+)$', re.MULTILINE)
+    base_assign_pattern = re.compile(r'^\s*([A-Za-z0-9_]+_BASE)\s*[:?+]?=\s*(.+)$')
+    addlib_s_pattern = re.compile(
+        r'\$\(eval\s+\$\(call\s+(?:addlib_s|addplat_s)\s*,\s*([^,\s\)]+)\s*,\s*([^\)]+)\)\)'
+    )
 
     # Walk all Makefile.uk files
     file_count = 0
     match_count = 0
+    skipped_refs = 0
     for dirpath, dirnames, filenames in os.walk(root_dir):
         # Skip build and git directories
         dirnames[:] = [d for d in dirnames if d not in ['build', '.git', '__pycache__']]
@@ -52,31 +183,40 @@ def extract_lib_srcs(root_dir):
                     print(f"Warning: Could not read {filepath}: {e}", file=sys.stderr)
                     continue
 
-                # Extract LIBXXX_BASE definitions
-                for match in lib_base_pattern.finditer(content):
-                    lib_var = match.group(1)
-                    lib_path = match.group(2).strip()
-                    lib_vars[lib_var + '_BASE'] = lib_path
+                lines = join_make_lines(content)
+                current_dir = os.path.dirname(filepath)
+                variables = {
+                    'CONFIG_UK_BASE': root_dir,
+                    'UK_BASE': root_dir,
+                    'UK_APP': root_dir,
+                    'UK_PLAT_COMMON_BASE': os.path.join(root_dir, 'plat', 'common'),
+                }
+                lib_conditions = {}
+
+                for line in lines:
+                    match = base_assign_pattern.match(line)
+                    if match:
+                        variables[match.group(1)] = resolve_vars(match.group(2).strip(), variables)
+
+                    match = addlib_s_pattern.search(line)
+                    if match:
+                        lib_conditions[lib_prefix_from_addlib(match.group(1))] = \
+                            normalize_config_condition(match.group(2))
 
                 # Extract LIBXXX_SRCS-* assignments
-                for match in lib_srcs_pattern.finditer(content):
+                for line in lines:
+                    match = lib_srcs_pattern.match(line)
+                    if not match:
+                        continue
                     match_count += 1
                     lib_prefix = match.group(1)  # e.g., LIBUKALLOC
                     condition_str = match.group(2)  # e.g., 'y' or '$(CONFIG_FOO)'
                     files_str = match.group(3)  # e.g., '$(LIBUKALLOC_BASE)/alloc.c'
+                    variables.setdefault(lib_prefix + '_BASE', current_dir)
 
-                    # Normalize condition
-                    if condition_str == 'y':
-                        condition = None  # unconditional
-                    elif condition_str == 'm':
-                        condition = 'MODULE'
-                    else:
-                        # Extract CONFIG variable
-                        config_match = re.search(r'CONFIG_\w+', condition_str)
-                        if config_match:
-                            condition = config_match.group(0)
-                        else:
-                            condition = condition_str
+                    file_condition = normalize_config_condition(condition_str)
+                    lib_condition = lib_conditions.get(lib_prefix)
+                    condition = combine_conditions(lib_condition, file_condition)
 
                     # Parse file list (split on whitespace and handle $(VAR))
                     files = files_str.split()
@@ -85,43 +225,24 @@ def extract_lib_srcs(root_dir):
                         if not file_ref:
                             continue
 
-                        orig_ref = file_ref
                         # Expand $(VAR) references
-                        for var_name, var_value in lib_vars.items():
-                            file_ref = file_ref.replace('$(' + var_name + ')', var_value)
-                            file_ref = file_ref.replace('${' + var_name + '}', var_value)
+                        resolved = resolve_vars(file_ref, variables)
+                        rel_path = relpath_from_root(resolved, root_dir, current_dir)
+                        if rel_path is None:
+                            skipped_refs += 1
+                            continue
 
-                        # Skip if still has unexpanded variables (only output this line for debugging)
-                        # print(f"  File ref: {orig_ref} -> {file_ref}", file=sys.stderr)
-                        if '$(' in file_ref or '${' in file_ref:
-                            # Try to extract the variable name and use a default path
-                            var_match = re.search(r'\$[\(\{](\w+)_BASE[\)\}]', file_ref)
-                            if var_match:
-                                # Assume lib/libname/ or lib/XYZ/ based on variable name
-                                lib_name = var_match.group(1).lower()
-                                # Convert LIBUKALLOC to libukalloc or similar
-                                if lib_name.startswith('lib'):
-                                    default_base = f"lib/{lib_name[3:]}"
-                                else:
-                                    default_base = f"lib/{lib_name}"
-                                file_ref = file_ref.replace(var_match.group(0), default_base)
-                            else:
-                                # Can't resolve, skip
-                                continue
-
-                        # Filter to source files
-                        if file_ref.endswith(('.c', '.cpp', '.cc', '.cxx', '.h', '.ld', '.S')):
-                            # Normalize path (remove ./)
-                            if file_ref.startswith('./'):
-                                file_ref = file_ref[2:]
-
-                            # Add condition
-                            if file_ref not in file_conditions:
-                                file_conditions[file_ref] = []
-                            if condition:
-                                file_conditions[file_ref].append(condition)
+                        file_symbol = normalize_file_symbol(rel_path)
+                        if condition:
+                            file_conditions[file_symbol].add(condition)
+                        else:
+                            file_conditions[file_symbol].add('')
     
-    print(f"Debug: Scanned {file_count} Makefile* files, found {match_count} SRCS patterns", file=sys.stderr)
+    print(
+        f"Debug: Scanned {file_count} Makefile* files, found {match_count} SRCS patterns, "
+        f"skipped {skipped_refs} unresolved/generated refs",
+        file=sys.stderr
+    )
 
     return file_conditions
 
@@ -146,13 +267,15 @@ def main(argc, argv):
         with open(output_file, 'w', encoding='utf-8') as f:
             for file_path in sorted(file_conditions.keys()):
                 conditions = file_conditions[file_path]
-                if not conditions:
+                if '' in conditions:
                     # Unconditional file
                     f.write("FILE_{}\n".format(file_path))
                 else:
-                    # Conditional file - output all conditions
-                    for cond in sorted(set(conditions)):
-                        f.write("FILE_{} {}\n".format(file_path, cond))
+                    condition = combine_alternatives(conditions)
+                    if condition:
+                        f.write('FILE_{} "{}"\n'.format(file_path, condition))
+                    else:
+                        f.write("FILE_{}\n".format(file_path))
 
         print("Extracted {} source files from {} into {}".format(
             len(file_conditions), root_dir, output_file), file=sys.stderr)
