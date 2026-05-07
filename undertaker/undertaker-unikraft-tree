@@ -197,7 +197,7 @@ if [ "$MODE" = "calc-coverage" ]; then
 fi
 
 if [ "$MODE" = "feature-statistics" ]; then
-    make_worklist undertaker-unikraft-worklist
+    make_worklist undertaker-unikraft-worklist "${UNDERTAKER_INCLUDE_HEADERS:-no}"
 
     "$UNDERTAKER_CMD" -k -j cppsym -b undertaker-unikraft-worklist -m "$MODELS" -M "$DEFAULT_ARCH" \
         2>undertaker-unikraft-cppsym.errors >undertaker-unikraft-all-cppsym.raw
@@ -216,7 +216,7 @@ END {
     exit 0
 fi
 
-make_worklist undertaker-unikraft-worklist
+make_worklist undertaker-unikraft-worklist "${UNDERTAKER_INCLUDE_HEADERS:-no}"
 
 find . -type f -name '*dead' -delete
 
