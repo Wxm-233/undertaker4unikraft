@@ -169,9 +169,30 @@ make_worklist() {
         return
     fi
 
+    local included_fragments
+    included_fragments=$(mktemp "${TMPDIR:-/tmp}/undertaker-unikraft-includes.XXXXXX")
+    find -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.S' -o -name '*.h' \) \
+        ! -path './build/*' ! -path './.git/*' ! -path './.git' \
+        -exec grep -h -E '^[[:space:]]*#[[:space:]]*include[[:space:]]*"[^"]+"' {} \; 2>/dev/null | \
+        sed -E 's/.*"([^"]+)".*/\1/;s#^.*/##' | sort -u > "$included_fragments"
+
     find -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.S' \) \
         ! -path './build/*' ! -path './.git/*' ! -path './.git' ! -path './support/*' \
-        -exec grep -q -E '^#[[:space:]]*if|^#[[:space:]]*else' {} \; -print | shuf > "$output_file"
+        -exec grep -q -E '^#[[:space:]]*if|^#[[:space:]]*else' {} \; -print | \
+        awk -v included="$included_fragments" '
+            BEGIN {
+                while ((getline name < included) > 0)
+                    skip[name] = 1
+                close(included)
+            }
+            {
+                base = $0
+                sub(/^.*\//, "", base)
+                if (!skip[base])
+                    print
+            }
+        ' | shuf > "$output_file"
+    rm -f "$included_fragments"
 }
 
 if [ "$MODE" = "calc-coverage" ]; then
