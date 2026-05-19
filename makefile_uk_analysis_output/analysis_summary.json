@@ -1,0 +1,30 @@
+{
+  "makefile_uk_analysis": {
+    "total_makefiles": 139,
+    "file_conditions": {
+      "total": 414,
+      "with_conditions": 402,
+      "without_conditions": 12,
+      "avg_condition_length": 27.243961352657006
+    },
+    "model_statistics": {
+      "total_lines": 1409,
+      "config_entries": 995,
+      "file_entries": 414,
+      "file_percentage": 29.382540809084457
+    }
+  },
+  "report_statistics": {
+    "total_reports": 109,
+    "dead_reports": 53,
+    "undead_reports": 56,
+    "defect_distribution": {
+      "missing": 34,
+      "kconfig": 19,
+      "kbuild": 31,
+      "no_kconfig": 23,
+      "code": 2
+    },
+    "kbuild_reports": 31
+  }
+}
